@@ -110,13 +110,14 @@ static void produce_state(Dev *d, std::vector<uint8_t> &st) {
         int n = 0;
         const bool *ks = SDL_GetKeyboardState(&n);
         uint8_t keys[256] = {};
-        for (int s = 0; s < n; s++) if (ks[s] || ui_key_injected((SDL_Scancode)s)) { uint32_t k = ui_dik_of((SDL_Scancode)s); if (k && k < 256) keys[k] = 0x80; }
+        for (int s = 0; s < n; s++) if ((ks[s] && !ui_scripted()) || ui_key_injected((SDL_Scancode)s)) { uint32_t k = ui_dik_of((SDL_Scancode)s); if (k && k < 256) keys[k] = 0x80; }
         for (auto &m : d->map) if (m.ofs < st.size()) st[m.ofs] = keys[d->objs[m.obj].index];
         return;
     }
     if (d->kind == DK_MOUSE) {
         float dx = 0, dy = 0;
         SDL_MouseButtonFlags b = SDL_GetRelativeMouseState(&dx, &dy);
+        if (ui_scripted()) { dx = dy = 0; b = 0; }
         int32_t wz = (int32_t)g_wheel; g_wheel -= (float)wz;
         for (auto &m : d->map) {
             const DevObj &o = d->objs[m.obj];

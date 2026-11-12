@@ -735,7 +735,15 @@ std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow
     // fixed-function fog (only applies to ps_2_x in D3D9)
     if (ps.major < 3)
         s += "    if (fogParams.x > 0.0) { float f = clamp(" + sm_varying(11, 0) + ".x, 0.0, 1.0); oC0.rgb = mix(fogColor.rgb, oC0.rgb, f); }\n";
-    s += "    if (!atest(oC0.a)) discard;\n";
+    s += "    // alphaFunc >= 16: alpha test as alpha-to-coverage (multisampled target), sharpened by the alpha gradient\n";
+    s += "    if (alphaFunc >= 16) {\n";
+    s += "        float c = clamp((oC0.a - alphaRef) / max(fwidth(oC0.a), 1e-4) + 0.5, 0.0, 1.0);\n";
+    s += "        int N = max(gl_NumSamples, 1), n = int(c * float(N) + 0.5);\n";
+    s += "        if (n == 0) discard;\n";
+    s += "        int full = N >= 32 ? -1 : (1 << N) - 1, m = n >= N ? full : (1 << n) - 1;\n";
+    s += "        int r = (int(gl_FragCoord.x) + 3 * int(gl_FragCoord.y)) % N;\n";
+    s += "        gl_SampleMask[0] = ((m << r) | (m >> (N - r))) & full;\n";
+    s += "    } else if (!atest(oC0.a)) discard;\n";
     if (ps.writes_depth) s += "    gl_FragDepth = clamp(o_depth.x, 0.0, 1.0);\n";
     s += "}\n";
     return s;

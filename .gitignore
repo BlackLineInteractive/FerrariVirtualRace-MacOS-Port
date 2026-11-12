@@ -29,3 +29,6 @@ __pycache__/
 .vscode/
 .idea/
 
+
+# Ghidra headless logs
+/ghidra/*.log

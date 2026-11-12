@@ -14,6 +14,10 @@
 #include <algorithm>
 #include <cmath>
 #include <fenv.h>
+#include <climits>
+#include <string>
+#include <SDL3/SDL.h>
+#include "win32ui.h"
 
 uint8_t *G;
 int g_trace_api = 0;
@@ -281,22 +285,69 @@ static void load_image() {
     rtlog("image loaded, %u imports (%d not implemented yet)", g_imp_count, missing);
 }
 
+// ---------------------------------------------------------------- game files location
+// FVR_GAME_DIR, then the app bundle's Resources/game, then the folder next to the .app or binary,
+// then the folder remembered from an earlier launch; otherwise ask once with a folder picker.
+static bool has_game(const std::string &d) {
+    if (d.empty()) return false;
+    std::string p = d + "/FerrariVR_Hi.exe";
+    return access(p.c_str(), R_OK) == 0;
+}
+static bool find_game_dir(const char *argv0) {
+    if (const char *gd = getenv("FVR_GAME_DIR")) { g_game_dir = gd; return true; }
+    char buf[PATH_MAX];
+    std::string exe = realpath(argv0, buf) ? buf : argv0;
+    std::string dir = exe.substr(0, exe.rfind('/'));
+    std::string saved_file = g_user_dir + "/game_path.txt";
+    std::vector<std::string> cand = {dir + "/../Resources/game", dir + "/../../..", dir + "/../../../game",
+                                     dir + "/../../../../../extracted", dir + "/..", dir + "/../../extracted"};
+    if (FILE *f = fopen(saved_file.c_str(), "r")) {
+        char line[PATH_MAX] = {};
+        if (fgets(line, sizeof line, f)) { std::string l = line; while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back(); cand.insert(cand.begin() + 1, l); }
+        fclose(f);
+    }
+    for (auto &c : cand) if (has_game(c)) { g_game_dir = realpath(c.c_str(), buf) ? buf : c; return true; }
+
+    // ask
+    ui_ensure_sdl();
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Ferrari Virtual Race",
+        "Choose the folder with the installed (or extracted) Windows version of Ferrari Virtual Race.\n"
+        "It must contain FerrariVR_Hi.exe.", nullptr);
+    for (;;) {
+        struct Pick { bool done = false; std::string path; } pick;
+        SDL_ShowOpenFolderDialog([](void *ud, const char *const *list, int) {
+            Pick *p = (Pick *)ud;
+            if (list && list[0]) p->path = list[0];
+            p->done = true;
+        }, &pick, nullptr, nullptr, false);
+        while (!pick.done) { SDL_PumpEvents(); SDL_Delay(20); }
+        if (pick.path.empty()) return false;
+        if (has_game(pick.path)) {
+            g_game_dir = pick.path;
+            if (FILE *f = fopen(saved_file.c_str(), "w")) { fprintf(f, "%s\n", pick.path.c_str()); fclose(f); }
+            return true;
+        }
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Ferrari Virtual Race",
+            "FerrariVR_Hi.exe was not found in that folder. If you only have the installer, extract it first:\n"
+            "tools/extract_game.sh <installer.exe> <folder>", nullptr);
+    }
+}
+
 int main(int argc, char **argv) {
     const char *trace = getenv("FVR_TRACE");
     g_trace_api = trace && *trace == '1';
 
-    // game data directory: next to the executable's Resources (app bundle) or FVR_GAME_DIR
-    const char *gd = getenv("FVR_GAME_DIR");
-    if (gd) g_game_dir = gd;
-    else {
-        std::string exe = argv[0];
-        std::string dir = exe.substr(0, exe.rfind('/'));
-        g_game_dir = dir + "/../Resources/game";
-    }
     const char *home = getenv("HOME");
     g_user_dir = std::string(home ? home : "/tmp") + "/Library/Application Support/FerrariVirtualRace";
     std::string mk = "mkdir -p '" + g_user_dir + "'";
     system(mk.c_str());
+    // Started from Finder (no terminal): keep the log in the user folder for bug reports.
+    if (strstr(argv[0], ".app/Contents/MacOS/") && !isatty(2)) {
+        freopen((g_user_dir + "/fvr.log").c_str(), "w", stderr);
+        setvbuf(stderr, nullptr, _IOLBF, 0);
+    }
+    if (!find_game_dir(argv[0])) return 1;
+    rtlog("game files: %s", g_game_dir.c_str());
 
     G = (uint8_t *)mmap(nullptr, 0x100000000ull, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
     if (G == MAP_FAILED) { perror("mmap guest space"); return 1; }

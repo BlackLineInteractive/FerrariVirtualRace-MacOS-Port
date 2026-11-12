@@ -30,6 +30,17 @@ gen: tools/recomp.py tools/fpu.py
 	rm -rf gen build/obj
 	$(PYTHON) tools/recomp.py "$(EXE)" ghidra/funcs_hi.jsonl gen
 
+# macOS app bundle (build/FerrariVR.app). GAME=<folder> adds the game's icon; EMBED=1 also copies
+# the game files into the bundle.
+GAME ?= ../extracted
+app: build/fvr
+	tools/make_app.sh "$(GAME)" $(if $(EMBED),--embed,)
+
+# install the bundle into /Applications
+install: app
+	rm -rf /Applications/FerrariVR.app
+	ditto build/FerrariVR.app /Applications/FerrariVR.app
+
 clean:
 	rm -rf build
-.PHONY: gen clean
+.PHONY: gen clean app install

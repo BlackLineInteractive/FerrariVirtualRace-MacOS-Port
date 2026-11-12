@@ -205,6 +205,8 @@ static uint32_t pos_lp() { return ((uint32_t)(uint16_t)g_mouse_x) | ((uint32_t)(
 // Lets automated runs walk menus; DirectInput sees them through ui_key_injected().
 static bool g_inject[SDL_SCANCODE_COUNT];
 bool ui_key_injected(SDL_Scancode s) { return s < SDL_SCANCODE_COUNT && g_inject[s]; }
+// Scripted runs ignore the real keyboard and mouse, so someone using the machine can't steer them.
+bool ui_scripted() { static int v = -1; if (v < 0) v = getenv("FVR_KEYS") ? 1 : 0; return v; }
 static void scripted_keys() {
     struct Ev { uint64_t t; SDL_Scancode sc; bool down; };
     static std::vector<Ev> evs; static size_t next; static uint64_t t0; static bool loaded;
@@ -246,6 +248,8 @@ void ui_pump() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         ui_extra_event(e);   // DirectInput: wheel, joystick hot-plug
+        if (ui_scripted() && ((e.type >= SDL_EVENT_KEY_DOWN && e.type < SDL_EVENT_MOUSE_MOTION) ||
+                              (e.type >= SDL_EVENT_MOUSE_MOTION && e.type < SDL_EVENT_JOYSTICK_AXIS_MOTION))) continue;
         switch (e.type) {
         case SDL_EVENT_QUIT:
             post(g_main_hwnd, WM_CLOSE, 0, 0);
@@ -554,7 +558,7 @@ API(user32, GetKeyState, 1) {
 }
 API(user32, GetCursorPos, 1) {
     float x = 0, y = 0;
-    if (g_sdl_ready) SDL_GetGlobalMouseState(&x, &y);
+    if (g_sdl_ready && !ui_scripted()) SDL_GetGlobalMouseState(&x, &y);
     W32(ARG(0), (int)x); W32(ARG(0) + 4, (int)y);
     RETN(1, 1);
 }

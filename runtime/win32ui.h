@@ -11,3 +11,4 @@ uint32_t    ui_dik_of(SDL_Scancode s);       // SDL scancode -> DirectInput DIK_
 extern void (*ui_extra_event_hook)(const SDL_Event &e);
 static inline void ui_extra_event(const SDL_Event &e) { if (ui_extra_event_hook) ui_extra_event_hook(e); }
 bool        ui_key_injected(SDL_Scancode s);  // debug key script (FVR_KEYS)
+bool        ui_scripted();                    // FVR_KEYS set: real keyboard and mouse are ignored

@@ -58,6 +58,11 @@ struct Surface : Obj {
     uint32_t w = 0, h = 0, fmt = 0, usage = 0, pool = 0, ms = 0;
     GLuint tex = 0;                 // standalone render target / depth surfaces own a GL texture
     GLuint rb = 0;                  // or a renderbuffer (multisampled)
+    // MSAA shadow (d3d9.cpp): a multisampled renderbuffer drawn instead of the texture; resolved
+    // into it when the game switches away. ms_dirty: renderbuffer newer; tex_dirty: texture newer.
+    GLuint ms_rb = 0, ms_fbo = 0;
+    int ms_n = 0;
+    bool ms_dirty = false, tex_dirty = false;
     uint32_t mem = 0;               // guest memory for locks / sysmem surfaces
     uint32_t lock_flags = 0;
     bool locked = false;

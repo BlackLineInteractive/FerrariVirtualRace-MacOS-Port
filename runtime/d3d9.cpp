@@ -35,6 +35,7 @@ void d3d_unlock() { g_d3d_mutex.unlock(); }
 #define GUARD D3DGuard guard_
 
 static int g_d3d_trace = -1;
+static bool rtlog_frame();
 static bool trace() { if (g_d3d_trace < 0) g_d3d_trace = getenv("FVR_D3D_TRACE") ? 1 : 0; return g_d3d_trace; }
 
 // ====================================================================== object registry
@@ -77,7 +78,9 @@ GLenum Surface::gl_target() const {
 static void free_fbos_for(GLuint tex);
 static void tex_cache_forget(GLuint tex);
 static void attr_cache_forget(GLuint buf);
+static void ms_free(Surface *s);
 Surface::~Surface() {
+    ms_free(this);
     if (container) return;
     if (tex) { free_fbos_for(tex); tex_cache_forget(tex); glDeleteTextures(1, &tex); }
     if (mem) gfree(mem);
@@ -118,6 +121,8 @@ static struct Device {
     DevState st;
     Surface *rt[4] = {}, *ds = nullptr;
     Surface *backbuf = nullptr, *autods = nullptr;
+    Surface *ms_att[5] = {};    // surfaces attached to the bound multisampled FBO (4 colour + depth)
+    bool ms_bound = false;
     GLuint vao = 0, up_vbo = 0, up_ibo = 0;
     GLuint samplers[20] = {};
     bool samp_dirty[20] = {};
@@ -762,8 +767,150 @@ static GLuint fbo_for(Surface *const *rts, int nrt, Surface *ds) {
     D->cur_fbo = f;
     return f;
 }
-static void bind_rt_fbo() {
+// ---------------------------------------------------------------- MSAA shadows
+// The game renders its scene into an HDR texture plus a depth surface the size of the back buffer.
+// With MSAA on, such a render-target set is drawn into multisampled renderbuffers instead and
+// resolved into the textures when the game switches render targets (or reads them some other way).
+// Anything that writes a texture outside that path marks it newer; it is copied back into the
+// renderbuffer before multisampled drawing continues, unless the game clears the whole target.
+int post_msaa_samples();
+void post_fill_ms(GLuint color, GLuint depth, int w, int h);
+static std::map<std::string, GLuint> g_msfbos;
+static GLint g_max_samples = -1;
+
+static void ms_free(Surface *s) {
+    if (!s->ms_rb) return;
+    std::string needle = "|" + std::to_string(s->ms_rb) + "|";
+    for (auto it = g_msfbos.begin(); it != g_msfbos.end();) {
+        if (("|" + it->first).find(needle) != std::string::npos) { glDeleteFramebuffers(1, &it->second); it = g_msfbos.erase(it); }
+        else ++it;
+    }
+    if (D) for (auto &a : D->ms_att) if (a == s) a = nullptr;
+    glDeleteFramebuffers(1, &s->ms_fbo);
+    glDeleteRenderbuffers(1, &s->ms_rb);
+    s->ms_rb = s->ms_fbo = 0; s->ms_n = 0; s->ms_dirty = s->tex_dirty = false;
+}
+static bool is_depth_surf(Surface *s) { const FmtInfo *fi = fmt_info(s->fmt); return fi && fi->depth; }
+static bool ms_ensure(Surface *s, int n) {
+    if (s->ms_rb && s->ms_n == n) return true;
+    ms_free(s);
+    const FmtInfo *fi = fmt_info(s->fmt);
+    if (!fi || fi->compressed || !s->gl_tex()) return false;
+    bool depth = fi->depth;
+    glGenRenderbuffers(1, &s->ms_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, s->ms_rb);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, n, fi->internal, s->w, s->h);
+    glGenFramebuffers(1, &s->ms_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, s->ms_fbo);
+    GLenum pt = !depth ? GL_COLOR_ATTACHMENT0 : fi->stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, pt, GL_RENDERBUFFER, s->ms_rb);
+    if (depth) { glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE); }
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    D->fbo_dirty = true;
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        rtlog("d3d9: MSAA %dx renderbuffer fmt %x unsupported (%04x)", n, s->fmt, st);
+        ms_free(s);
+        return false;
+    }
+    s->ms_n = n;
+    s->tex_dirty = true;   // the texture holds the current contents
+    return true;
+}
+static void ms_resolve(Surface *s) {
+    if (!s || !s->ms_rb || !s->ms_dirty) return;
+    bool depth = is_depth_surf(s);
+    Surface *one = s;
+    GLuint dst = depth ? fbo_for(nullptr, 0, s) : fbo_for(&one, 1, nullptr);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, s->ms_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glDisable(GL_SCISSOR_TEST);
+    if (depth) glDepthMask(GL_TRUE); else glColorMask(1, 1, 1, 1);
+    const FmtInfo *fi = fmt_info(s->fmt);
+    glBlitFramebuffer(0, 0, s->w, s->h, 0, 0, s->w, s->h,
+                      depth ? (GL_DEPTH_BUFFER_BIT | (fi->stencil ? GL_STENCIL_BUFFER_BIT : 0)) : GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    s->ms_dirty = false;
+    D->fbo_dirty = true; D->rs_dirty = true;
+}
+// Resolve whatever the bound multisampled FBO holds (before anything reads those textures).
+static void ms_flush() {
+    if (!D->ms_bound) return;
+    for (Surface *s : D->ms_att) ms_resolve(s);
+    D->fbo_dirty = true;
+}
+// A texture surface was written outside the multisampled path.
+static void ms_touch(Surface *s) { if (s && s->ms_rb) { ms_resolve(s); s->tex_dirty = true; } }
+
+static bool ms_eligible(int n) {
+    if (n <= 0 || !D->ds || !D->rt[0] || !D->backbuf) return false;
+    uint32_t w = D->backbuf->w, h = D->backbuf->h;
+    if (D->ds->w != w || D->ds->h != h || D->ds->pool == 2 || D->ds->pool == 3) return false;
+    for (int i = 0; i < 4; i++) {
+        Surface *s = D->rt[i];
+        if (s && (s->w != w || s->h != h || is_depth_surf(s) || !s->gl_tex())) return false;
+    }
+    return true;
+}
+// clear_flags: D3DCLEAR_* about to cover the whole target (skips copying stale texture contents in)
+static void bind_rt_fbo(uint32_t clear_flags = 0) {
     if (!D->fbo_dirty) return;
+    if (D->ms_bound) { ms_flush(); D->ms_bound = false; }
+    int n = post_msaa_samples();
+    if (n > 0) {
+        if (g_max_samples < 0) { glGetIntegerv(GL_MAX_SAMPLES, &g_max_samples); rtlog("d3d9: GL_MAX_SAMPLES %d", g_max_samples); }
+        n = std::min(n, (int)g_max_samples);
+    }
+    if (ms_eligible(n)) {
+        Surface *att[5] = {D->rt[0], D->rt[1], D->rt[2], D->rt[3], D->ds};
+        bool ok = true;
+        for (Surface *s : att) if (s && !ms_ensure(s, n)) ok = false;
+        if (ok) {
+            std::string key;
+            for (Surface *s : att) key += s ? std::to_string(s->ms_rb) + "|" : "0|";
+            GLuint f;
+            auto it = g_msfbos.find(key);
+            if (it != g_msfbos.end()) { f = it->second; glBindFramebuffer(GL_FRAMEBUFFER, f); }
+            else {
+                glGenFramebuffers(1, &f);
+                glBindFramebuffer(GL_FRAMEBUFFER, f);
+                GLenum bufs[4]; int nb = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (att[i]) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER, att[i]->ms_rb);
+                    bufs[i] = att[i] ? GL_COLOR_ATTACHMENT0 + i : GL_NONE;
+                    if (att[i]) nb = i + 1;
+                }
+                const FmtInfo *fi = fmt_info(att[4]->fmt);
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, fi->stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, att[4]->ms_rb);
+                glDrawBuffers(nb, bufs);
+                GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                if (st != GL_FRAMEBUFFER_COMPLETE) {
+                    rtlog("d3d9: MSAA FBO incomplete %04x", st);
+                    glDeleteFramebuffers(1, &f); f = 0; ok = false;
+                } else g_msfbos[key] = f;
+            }
+            if (ok) {
+                // bring in texture contents written outside the multisampled path
+                bool cc = clear_flags & 1, cz = clear_flags & 2;
+                for (int i = 0; i < 4; i++) if (att[i] && cc) att[i]->tex_dirty = false;
+                if (cz) att[4]->tex_dirty = false;
+                bool upc = att[0]->tex_dirty, upz = att[4]->tex_dirty;
+                if (upc || upz) {
+                    post_fill_ms(upc ? att[0]->gl_tex() : 0, upz ? att[4]->gl_tex() : 0, att[4]->w, att[4]->h);
+                    glBindVertexArray(D->vao);
+                    gl_cache_reset();
+                    D->rs_dirty = true; D->vp_dirty = true;
+                    for (Surface *s : att) if (s) s->tex_dirty = false;
+                }
+                for (int i = 0; i < 5; i++) { D->ms_att[i] = att[i]; if (att[i]) att[i]->ms_dirty = true; }
+                D->ms_bound = true;
+                D->cur_fbo = f;
+                D->fbo_dirty = false;
+                return;
+            }
+        }
+    }
+    // single-sampled: surfaces that also have a multisampled shadow now get newer texture contents
+    for (int i = 0; i < 4; i++) if (D->rt[i] && D->rt[i]->ms_rb) D->rt[i]->tex_dirty = true;
+    if (D->ds && D->ds->ms_rb) D->ds->tex_dirty = true;
     GLuint f = fbo_for(D->rt, 4, D->ds);
     glBindFramebuffer(GL_FRAMEBUFFER, f);
     D->cur_fbo = f;
@@ -1076,7 +1223,9 @@ static void upload_consts(Program *p) {
         if (fx != p->u_fix[0] || fy != p->u_fix[1]) { glUniform4f(p->posFixup, fx, fy, 0, 0); p->u_fix[0] = fx; p->u_fix[1] = fy; }
     }
     uint32_t *rs = st.rs;
-    if (p->alphaFunc >= 0) { int af = rs[15] ? (int)rs[25] : 8; if (af != p->u_afunc) { glUniform1i(p->alphaFunc, af); p->u_afunc = af; } }
+    if (p->alphaFunc >= 0) { int af = rs[15] ? (int)rs[25] : 8;
+        if (D->ms_bound && (af == 5 || af == 7) && !rs[27]) af += 16;   // alpha-to-coverage under MSAA
+        if (af != p->u_afunc) { glUniform1i(p->alphaFunc, af); p->u_afunc = af; } }
     if (p->alphaRef >= 0) { float ar = (rs[24] & 255) / 255.0f; if (ar != p->u_aref) { glUniform1f(p->alphaRef, ar); p->u_aref = ar; } }
     if (p->vfaceSign >= 0 && !p->u_vface) { glUniform1f(p->vfaceSign, 1.0f); p->u_vface = true; }
     if (p->fogColor >= 0) {
@@ -1351,7 +1500,12 @@ static void set_decl(Decl *d) {
     Decl *o = D->st.decl; D->st.decl = d;
     if (o) obj_release(o);
 }
+static bool rtlog_frame() {   // FVR_RT_LOG=N: log render-target traffic during frame N
+    static long f = getenv("FVR_RT_LOG") ? atol(getenv("FVR_RT_LOG")) : -1;
+    return f >= 0 && (long)D->frame == f;
+}
 static void set_rt(int i, Surface *s) {
+    if (rtlog_frame()) rtlog("RT%d <- %s %ux%u fmt %x tex %u lvl %d (draws %u)", i, s ? (s->container ? "tex" : "surf") : "null", s ? s->w : 0, s ? s->h : 0, s ? s->fmt : 0, s ? s->gl_tex() : 0, s ? s->level : 0, (unsigned)D->draws);
     if (D->rt[i] == s) return;
     if (s) obj_addref(s);
     Surface *o = D->rt[i]; D->rt[i] = s;
@@ -1360,6 +1514,7 @@ static void set_rt(int i, Surface *s) {
     D->rs_dirty = true;
 }
 static void set_ds(Surface *s) {
+    if (rtlog_frame()) rtlog("DS <- %ux%u fmt %x tex %u (draws %u)", s ? s->w : 0, s ? s->h : 0, s ? s->fmt : 0, s ? s->gl_tex() : 0, (unsigned)D->draws);
     if (D->ds == s) return;
     if (s) obj_addref(s);
     Surface *o = D->ds; D->ds = s;
@@ -1440,7 +1595,16 @@ static void apply_window_mode() {
     uint32_t w = D->pp[0], h = D->pp[1];
     if (windowed) {
         SDL_SetWindowFullscreen(g_win, false);
-        SDL_SetWindowSize(g_win, (int)w, (int)h);
+        // window size is in points (a Retina panel shows it at 2x pixels); 2K / 4K modes are scaled
+        // down to fit the screen, so they act as supersampling
+        SDL_DisplayID did = SDL_GetDisplayForWindow(g_win);
+        double ww = w, wh = h;
+        SDL_Rect ub;
+        if (SDL_GetDisplayUsableBounds(did ? did : SDL_GetPrimaryDisplay(), &ub)) {
+            double f = std::min(1.0, std::min(ub.w * 0.98 / ww, (ub.h - 28) * 0.98 / wh));
+            ww *= f; wh *= f;
+        }
+        SDL_SetWindowSize(g_win, (int)(ww + 0.5), (int)(wh + 0.5));
         SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     } else {
         SDL_SetWindowFullscreenMode(g_win, nullptr);      // borderless desktop fullscreen, back buffer is scaled
@@ -1454,11 +1618,19 @@ static void apply_window_mode() {
 
 static void debug_shot() {
     static const char *frames = getenv("FVR_SHOT_FRAMES");
+    static const char *secs = getenv("FVR_SHOT_SECS");   // seconds since start, e.g. "40,45"
     static const char *dir = getenv("FVR_SHOT_DIR");
-    if (!frames || !dir) return;
-    char key[32]; snprintf(key, sizeof key, ",%llu,", (unsigned long long)D->frame);
-    std::string list = std::string(",") + frames + ",";
-    if (list.find(key) == std::string::npos) return;
+    if ((!frames && !secs) || !dir) return;
+    if (secs) {
+        static std::vector<double> marks; static size_t next = 0; static bool parsed = false;
+        if (!parsed) { parsed = true; for (const char *p = secs; *p;) { marks.push_back(strtod(p, (char **)&p)); while (*p == ',') p++; } }
+        if (next >= marks.size() || SDL_GetTicks() / 1000.0 < marks[next]) return;
+        next++;
+    } else {
+        char key[32]; snprintf(key, sizeof key, ",%llu,", (unsigned long long)D->frame);
+        std::string list = std::string(",") + frames + ",";
+        if (list.find(key) == std::string::npos) return;
+    }
     uint32_t w = D->backbuf->w, h = D->backbuf->h;
     std::vector<uint8_t> px((size_t)w * h * 4);
     GLuint f = fbo_for(&D->backbuf, 1, nullptr);
@@ -1479,6 +1651,7 @@ bool post_present(int mode, GLuint bb, int bw, int bh, int dx, int dy, int dw, i
 
 static void present() {
     if (!D->backbuf) return;
+    ms_flush();
     debug_shot();
     int ww = 0, wh = 0;
     SDL_GetWindowSizeInPixels(g_win, &ww, &wh);
@@ -1712,6 +1885,7 @@ M(dev_UpdateTexture) {
 static void read_surface_into(Surface *src, uint32_t dst_mem, uint32_t dst_fmt, uint32_t w, uint32_t h) {
     const FmtInfo *fi = fmt_info(dst_fmt);
     if (!fi || fi->compressed || fi->depth) return;
+    ms_flush();
     GLuint f = fbo_for(&src, 1, nullptr);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, f);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -1743,6 +1917,9 @@ M(dev_StretchRect) {
     if (ARG(4)) { dx0 = R32(ARG(4)); dy0 = R32(ARG(4) + 4); dx1 = R32(ARG(4) + 8); dy1 = R32(ARG(4) + 12); }
     const FmtInfo *fs = fmt_info(src->fmt);
     bool depth = fs && fs->depth;
+    if (rtlog_frame()) rtlog("StretchRect tex %u %ux%u -> tex %u %ux%u (%d,%d,%d,%d)->(%d,%d,%d,%d) draws %u", src->gl_tex(), src->w, src->h, dst->gl_tex(), dst->w, dst->h, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, (unsigned)D->draws);
+    ms_flush();
+    ms_touch(dst);
     if (!src->gl_tex() && src->mem) {   // sysmem -> GL surface
         uint32_t pitch; uint32_t m = surface_cpu(src, &pitch);
         upload_surface_rect(dst, dx0, dy0, dx1 - dx0, dy1 - dy0, H(m + sy0 * pitch + sx0 * fs->bpp), pitch);
@@ -1765,6 +1942,8 @@ M(dev_ColorFill) {
     GUARD;
     Surface *s = OBJ<Surface>(ARG(1));
     uint32_t col = ARG(3);
+    ms_flush();
+    ms_touch(s);
     GLuint f = fbo_for(&s, 1, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, f);
     glColorMask(1, 1, 1, 1);
@@ -1809,7 +1988,14 @@ M(dev_Clear) {
     GUARD;
     uint32_t count = ARG(1), rects = ARG(2), flags = ARG(3), color = ARG(4), stencil = ARG(6);
     float z = ARGF(5);
-    bind_rt_fbo();
+    if (rtlog_frame()) rtlog("Clear flags %x draws %u", flags, (unsigned)D->draws);
+    {
+        Viewport &v = D->st.vp;
+        Surface *t = D->rt[0] ? D->rt[0] : D->ds;
+        bool full = t && !(count && rects) && v.x == 0 && v.y == 0 && v.w >= t->w && v.h >= t->h &&
+                    (!D->st.rs[174] || (D->st.scissor[0] <= 0 && D->st.scissor[1] <= 0 && D->st.scissor[2] >= (int)t->w && D->st.scissor[3] >= (int)t->h));
+        bind_rt_fbo(full ? flags : 0);
+    }
     GLbitfield mask = 0;
     if (flags & 1) { mask |= GL_COLOR_BUFFER_BIT; glColorMask(1, 1, 1, 1); for (int i = 1; i < 4; i++) glColorMaski(i, 1, 1, 1, 1);
         glClearColor(((color >> 16) & 255) / 255.f, ((color >> 8) & 255) / 255.f, (color & 255) / 255.f, (color >> 24) / 255.f); }
@@ -1931,7 +2117,7 @@ M(dev_SetTexture) {
     if (D->recording) D->recording->tex[i] = true;
     if (t && t->kind != K_SURF) {
         Texture *tx = static_cast<Texture *>(t);
-        if (tx->rendered && tx->autogen && tx->tex) { scratch_bind(tx->target, tx->tex); glGenerateMipmap(tx->target); tx->rendered = false; D->mipgens++; }
+        if (tx->rendered && tx->autogen && tx->tex) { ms_flush(); scratch_bind(tx->target, tx->tex); glGenerateMipmap(tx->target); tx->rendered = false; D->mipgens++; }
     }
     RETN(3, D3D_OK);
 }
@@ -2139,17 +2325,27 @@ M(sw_GetPresentParameters) { GUARD; for (int i = 0; i < 14; i++) W32(ARG(1) + 4 
 
 // ====================================================================== IDirect3D9
 struct ModeList { std::vector<std::pair<int, int>> m; };
+// Display modes offered to the game. The back buffer is an off-screen texture scaled into the window,
+// so any size works: we list the usual ones up to 4K plus the display's native pixel size (Retina
+// panels report a smaller desktop size in points).
 static ModeList &modes() {
     static ModeList ml;
     if (ml.m.empty()) {
         ui_ensure_sdl();
         const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
         int dw = dm ? dm->w : 1920, dh = dm ? dm->h : 1080;
+        float dens = dm && dm->pixel_density > 0 ? dm->pixel_density : 1.0f;
+        int nw = (int)(dw * dens + 0.5f), nh = (int)(dh * dens + 0.5f);
         static const int common[][2] = {{640, 480}, {800, 600}, {1024, 768}, {1152, 864}, {1280, 720}, {1280, 768}, {1280, 800},
             {1280, 960}, {1280, 1024}, {1360, 768}, {1366, 768}, {1440, 900}, {1600, 900}, {1600, 1200}, {1680, 1050},
-            {1920, 1080}, {1920, 1200}, {2048, 1152}, {2560, 1440}, {2560, 1600}};
-        for (auto &c2 : common) if (c2[0] <= dw && c2[1] <= dh) ml.m.push_back({c2[0], c2[1]});
-        if (std::find(ml.m.begin(), ml.m.end(), std::make_pair(dw, dh)) == ml.m.end()) ml.m.push_back({dw, dh});
+            {1920, 1080}, {1920, 1200}, {2048, 1152}, {2560, 1440}, {2560, 1600}, {2880, 1620}, {2880, 1800}, {3200, 1800},
+            {3840, 2160}, {3840, 2400}};
+        int maxw = std::max(nw, 3840), maxh = std::max(nh, 2160);
+        for (auto &c2 : common) if (c2[0] <= maxw && c2[1] <= maxh) ml.m.push_back({c2[0], c2[1]});
+        for (auto extra : {std::make_pair(dw, dh), std::make_pair(nw, nh)})
+            if (std::find(ml.m.begin(), ml.m.end(), extra) == ml.m.end()) ml.m.push_back(extra);
+        std::sort(ml.m.begin(), ml.m.end());
+        rtlog("d3d9: %zu display modes, native %dx%d (%dx%d points)", ml.m.size(), nw, nh, dw, dh);
     }
     return ml;
 }
@@ -2190,11 +2386,12 @@ M(d3d_CheckDeviceFormat) {
     if (trace() || r) rtlog("d3d9: CheckDeviceFormat usage %x rtype %u fmt %08x -> %s", usage, rtype, fmt, r ? "no" : "ok");
     RETN(7, r);
 }
+bool post_aa_type_supported(uint32_t t);
 M(d3d_CheckDeviceMultiSampleType) {
     // Types 2 and 3 are offered to the game's AA menu and mapped to FXAA / FSR post-processing
     // (d3d9_post.cpp); surfaces created with them are not really multisampled.
     uint32_t ms = ARG(5);
-    bool ok = ms == 0 || ms == 2 || ms == 3;
+    bool ok = post_aa_type_supported(ms);
     if (ARG(6)) W32(ARG(6), ok ? 1 : 0);
     RETN(7, ok ? D3D_OK : D3DERR_NOTAVAILABLE);
 }
@@ -2206,8 +2403,39 @@ M(d3d_GetAdapterMonitor) { RETN(2, 0x00C20001); }
 static void init_vtables();
 M(d3d_CreateDevice) {
     GUARD;
-    if (D) { rtlog("d3d9: second device not supported"); RETN(7, D3DERR_NOTAVAILABLE); }
     uint32_t hfocus = ARG(3), behavior = ARG(4), pp = ARG(5);
+    if (D) {
+        // The game recreates its window and device after "Video settings" changes. Keep the one GL
+        // context (all GL objects stay valid), move it to the new window and reinitialise like Reset.
+        uint32_t hwnd = R32(pp + 28) ? R32(pp + 28) : hfocus;
+        SDL_Window *nw = ui_sdl_window(hwnd);
+        if (!nw) { rtlog("d3d9: CreateDevice without a window"); RETN(7, D3DERR_INVALIDCALL); }
+        ms_flush(); D->ms_bound = false;
+        D->d3d = ARG(0);
+        D->behavior = behavior;
+        for (int i = 0; i < 14; i++) D->pp[i] = R32(pp + 4 * i);
+        D->hwnd = hwnd;
+        g_win = nw;
+        if (!D->pp[0] || !D->pp[1]) { int w, h; SDL_GetWindowSize(g_win, &w, &h); D->pp[0] = w; D->pp[1] = h; W32(pp, w); W32(pp + 4, h); }
+        if (!D->pp[2]) { D->pp[2] = 22; W32(pp + 8, 22); }
+        if (!D->pp[3]) { D->pp[3] = 1; W32(pp + 12, 1); }
+        SDL_GL_MakeCurrent(g_win, g_ctx);
+        g_ctx_thread = pthread_self(); g_ctx_bound = true;
+        rtlog("d3d9: CreateDevice again (%ux%u windowed=%u): reusing the GL context", D->pp[0], D->pp[1], D->pp[8]);
+        if (!obj_get(D->guest)) { Obj *dev = new Obj(K_DEVICE); D->guest = obj_publish(dev, g_vt[K_DEVICE]); }
+        else obj_addref(obj_get(D->guest));
+        if (!obj_get(D->swap)) { Obj *sw = new Obj(K_SWAP); D->swap = obj_publish(sw, g_vt[K_SWAP]); }
+        obj_addref(obj_get(D->d3d));
+        reset_state();
+        set_rt(0, nullptr); set_ds(nullptr);
+        if (D->backbuf) { Surface *b = D->backbuf; D->backbuf = nullptr; obj_release(b); }
+        if (D->autods) { Surface *b = D->autods; D->autods = nullptr; obj_release(b); }
+        create_backbuffer();
+        apply_window_mode();
+        D->fbo_dirty = D->rs_dirty = D->vp_dirty = true;
+        W32(ARG(6), D->guest);
+        RETN(7, D3D_OK);
+    }
     D = new Device();
     D->d3d = ARG(0);
     D->behavior = behavior;
@@ -2347,6 +2575,7 @@ uint32_t d3d9_surface_read(uint32_t surf_guest, std::vector<uint8_t> &rgba, uint
         return D3D_OK;
     }
     if (s->gl_tex()) {
+        ms_flush();
         GLuint f = fbo_for(&s, 1, nullptr);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, f);
         glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
@@ -2399,6 +2628,7 @@ bool d3d9_get_rgba(uint32_t surf, int x0, int y0, int w, int h, std::vector<uint
         return true;
     }
     if (s->gl_tex() && fi && !fi->depth) {
+        ms_flush();
         GLuint f = fbo_for(&s, 1, nullptr);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, f);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);

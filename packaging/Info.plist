@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>             <string>Ferrari Virtual Race</string>
+    <key>CFBundleDisplayName</key>      <string>Ferrari Virtual Race</string>
+    <key>CFBundleIdentifier</key>       <string>com.blacklineinteractive.ferrarivirtualrace</string>
+    <key>CFBundleExecutable</key>       <string>fvr</string>
+    <key>CFBundleIconFile</key>         <string>AppIcon</string>
+    <key>CFBundlePackageType</key>      <string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+    <key>CFBundleVersion</key>          <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>   <string>@MINOS@</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.racing-games</string>
+    <key>LSArchitecturePriority</key>   <array><string>x86_64</string></array>
+    <key>NSHighResolutionCapable</key>  <true/>
+    <key>GCSupportsControllerUserInteraction</key><true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key><false/>
+</dict>
+</plist>

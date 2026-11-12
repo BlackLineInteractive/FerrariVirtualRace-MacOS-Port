@@ -1,11 +1,13 @@
-// Post-processing anti-aliasing applied when the back buffer is presented.
+// Anti-aliasing modes offered in the game's "Anti Aliasing" option.
 //
-// The game's "Anti Aliasing" option lists the D3D multisample types the device reports. We report
-// types 2 and 3 and present them as:
-//   2 -> FXAA  (FXAA 3.11 style, quality preset ~12)
-//   3 -> FSR   (FXAA, then AMD FidelityFX Super Resolution 1: EASU upscale to the window's native
-//               pixel size, then RCAS sharpening)
-// Real multisampling is not performed; render targets created with these types are ordinary ones.
+// The game lists the D3D multisample types the device reports (index == type, see the table at
+// 0x67a980 in FerrariVR_Hi.exe) and stores the chosen index in a global. We report types 2..6:
+//   2 -> FXAA       post pass (FXAA 3.11 style, quality preset ~12)
+//   3 -> MSAA 2x    real multisampling of the scene (d3d9.cpp, "MSAA shadows")
+//   4 -> MSAA 4x
+//   5 -> MSAA 8x
+//   6 -> FSR 1      MSAA 4x, then AMD FidelityFX Super Resolution 1: EASU upscale to the window's
+//                   native pixel size and RCAS sharpening
 #define GL_SILENCE_DEPRECATION
 #include "rt.h"
 #include <OpenGL/gl3.h>
@@ -16,22 +18,35 @@
 // Guest global holding the clamped "AntiAlias" index (FerrariVR_Hi.exe).
 static const uint32_t kGuestAntiAlias = 0x9cf280;
 
-int post_aa_mode() {
+struct AaMode { int post, samples; const char *label; };   // post: 0 none, 1 FXAA, 2 FSR 1
+static const AaMode kModes[] = {
+    {0, 0, nullptr}, {0, 0, nullptr}, {1, 0, "FXAA"}, {0, 2, "MSAA 2x"}, {0, 4, "MSAA 4x"}, {0, 8, "MSAA 8x"}, {2, 4, "FSR 1"},
+};
+static const int kNumModes = sizeof kModes / sizeof kModes[0];
+
+static const AaMode &aa_mode() {
     static int forced = -2;
     if (forced == -2) {
         const char *e = getenv("FVR_AA");
-        forced = !e ? -1 : !strcmp(e, "fxaa") ? 1 : !strcmp(e, "fsr") ? 2 : 0;
+        forced = -1;
+        if (e) {
+            forced = 0;
+            static const char *names[] = {"off", "", "fxaa", "msaa2", "msaa4", "msaa8", "fsr"};
+            for (int i = 0; i < kNumModes; i++) if (!strcmp(e, names[i])) forced = i;
+        }
     }
-    if (forced >= 0) return forced;
-    uint32_t v = R32(kGuestAntiAlias);
-    return v == 2 ? 1 : v == 3 ? 2 : 0;
+    uint32_t v = forced >= 0 ? (uint32_t)forced : R32(kGuestAntiAlias);
+    return kModes[v < (uint32_t)kNumModes ? v : 0];
 }
+int post_aa_mode() { return aa_mode().post; }
+int post_msaa_samples() { return aa_mode().samples; }
+bool post_aa_type_supported(uint32_t t) { return t == 0 || (t < (uint32_t)kNumModes && kModes[t].label); }
 
 // Options menu: the game formats each entry as "%dx" from the multisample type.
 extern "C" void fvr_hook_aa_label(CPU *c) {
     uint32_t buf = R32(c->esp), n = R32(c->esp + 4), idx = R32(c->esp + 12);
     char tmp[16];
-    const char *s = idx == 2 ? "FXAA" : idx == 3 ? "FSR" : nullptr;
+    const char *s = idx < (uint32_t)kNumModes ? kModes[idx].label : nullptr;
     if (!s) { snprintf(tmp, sizeof tmp, "%ux", idx); s = tmp; }
     gstrcpy(buf, s, n);
     c->eax = (uint32_t)strlen(s);
@@ -308,27 +323,71 @@ bool post_present(int mode, GLuint bb, int bw, int bh, int dx, int dy, int dw, i
     glActiveTexture(GL_TEXTURE0);
     glBindSampler(0, g_sampler);
 
-    ensure(g_a, bw, bh);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_a.fbo);
-    run(g_fxaa, bb, 0, 0, bw, bh, false);
-
     if (mode == 1) {
+        ensure(g_a, bw, bh);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_a.fbo);
+        run(g_fxaa, bb, 0, 0, bw, bh, false);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         run(g_copy, g_a.tex, dx, dy, dw, dh, true);
     } else if (dw > bw || dh > bh) {
         ensure(g_b, dw, dh);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_b.fbo);
-        run(g_easu, g_a.tex, 0, 0, dw, dh, false);
+        run(g_easu, bb, 0, 0, dw, dh, false);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         run(g_rcas, g_b.tex, dx, dy, dw, dh, true, 0.87f);   // exp2(-0.2 stops)
     } else {
         ensure(g_b, bw, bh);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_b.fbo);
-        run(g_rcas, g_a.tex, 0, 0, bw, bh, false, 0.87f);
+        run(g_rcas, bb, 0, 0, bw, bh, false, 0.87f);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         run(g_copy, g_b.tex, dx, dy, dw, dh, true);
     }
     glBindSampler(0, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Copy a single-sampled colour (and optionally depth) texture into the bound multisampled draw
+// framebuffer, writing every sample. Used when the game wrote a render target outside the
+// multisampled path and then draws into it again. The caller restores its GL state cache.
+static const char *kFillFS = R"(#version 410 core
+uniform sampler2D col;
+uniform sampler2D dep;
+uniform int mode;   // bit 0: colour, bit 1: depth
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    o = (mode & 1) != 0 ? texelFetch(col, p, 0) : vec4(0.0);
+    gl_FragDepth = (mode & 2) != 0 ? texelFetch(dep, p, 0).r : 1.0;
+}
+)";
+void post_fill_ms(GLuint color, GLuint depth, int w, int h) {
+    static GLuint prog = 0, vao = 0; static GLint lcol, ldep, lmode;
+    if (!prog) {
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(vs, 1, &kVS, nullptr); glCompileShader(vs);
+        glShaderSource(fs, 1, &kFillFS, nullptr); glCompileShader(fs);
+        prog = glCreateProgram();
+        glAttachShader(prog, vs); glAttachShader(prog, fs); glLinkProgram(prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        lcol = glGetUniformLocation(prog, "col"); ldep = glGetUniformLocation(prog, "dep"); lmode = glGetUniformLocation(prog, "mode");
+        glGenVertexArrays(1, &vao);
+    }
+    glDisable(GL_BLEND); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_FRAMEBUFFER_SRGB); glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMask(color ? 1 : 0, color ? 1 : 0, color ? 1 : 0, color ? 1 : 0);
+    if (depth) { glEnable(GL_DEPTH_TEST); glDepthFunc(GL_ALWAYS); glDepthMask(GL_TRUE); } else glDisable(GL_DEPTH_TEST);
+    glViewport(0, 0, w, h);
+    glDepthRange(0.0, 1.0);
+    glUseProgram(prog);
+    glUniform1i(lcol, 0); glUniform1i(ldep, 1);
+    glUniform1i(lmode, (color ? 1 : 0) | (depth ? 2 : 0));
+    glActiveTexture(GL_TEXTURE0); glBindSampler(0, 0); glBindTexture(GL_TEXTURE_2D, color);
+    glActiveTexture(GL_TEXTURE1); glBindSampler(1, 0); glBindTexture(GL_TEXTURE_2D, depth);
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
 }

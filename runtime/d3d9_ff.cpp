@@ -251,7 +251,15 @@ std::string ff_ps_source(const DevState &st, const SmShader *vs, std::string &ke
          "        }\n"
          "        oC0.rgb = mix(fogColor.rgb, oC0.rgb, clamp(f, 0.0, 1.0));\n"
          "    }\n";
-    s += "    if (!atest(oC0.a)) discard;\n";
+    s += "    // alphaFunc >= 16: alpha test as alpha-to-coverage (multisampled target), sharpened by the alpha gradient\n";
+    s += "    if (alphaFunc >= 16) {\n";
+    s += "        float c = clamp((oC0.a - alphaRef) / max(fwidth(oC0.a), 1e-4) + 0.5, 0.0, 1.0);\n";
+    s += "        int N = max(gl_NumSamples, 1), n = int(c * float(N) + 0.5);\n";
+    s += "        if (n == 0) discard;\n";
+    s += "        int full = N >= 32 ? -1 : (1 << N) - 1, m = n >= N ? full : (1 << n) - 1;\n";
+    s += "        int r = (int(gl_FragCoord.x) + 3 * int(gl_FragCoord.y)) % N;\n";
+    s += "        gl_SampleMask[0] = ((m << r) | (m >> (N - r))) & full;\n";
+    s += "    } else if (!atest(oC0.a)) discard;\n";
     s += "}\n";
     return s;
 }
