@@ -1046,10 +1046,31 @@ static float fvr_option(const char *name, float def) {
     auto it = opts.find(name);
     return it != opts.end() ? it->second : def;
 }
+// Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 keeps the scene's acceleration structures;
+// rt_view=1 also traces it on the GPU and shows that instead of the game's image (a check).
+static int rt_view_mode() { static int v = (int)fvr_option("rt_view", 0); return v; }
+static bool rt_enabled() { static bool on = fvr_option("rt", 0) > 0 || rt_view_mode() > 0; return on; }
+// Copies the ray-traced image (rectangle texture, w x h) over the scene colour (lw x lh).
+static void rt_show(GLuint rect, int w, int h, GLuint col, int lw, int lh) {
+    static GLuint rf, df;
+    if (!rf) { glGenFramebuffers(1, &rf); glGenFramebuffers(1, &df); }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, rf);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, rect, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, df);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, col, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(1, 1, 1, 1);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, lw, lh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 static void taa_resolve(Surface *dst) {
     bool reset = !D->taa_have || D->taa_last + 1 != D->frame;
     GLuint col = D->taa_col;
     taa_timer(1);
+    if (rt_view_mode() > 0 && D->ivp_ok) {
+        if (GLuint rect = rt_trace_view(D->frame, D->vp_cur, D->ivp_cur, D->taa_lw, D->taa_lh, rt_view_mode())) rt_show(rect, D->taa_lw, D->taa_lh, col, D->taa_lw, D->taa_lh);
+    }
     static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
     float ivp[16];
     if ((ssr > 0 || ao > 0) && D->vp_cur_ok && mat4_inv(D->vp_cur, ivp)) {
@@ -1704,19 +1725,38 @@ static bool rt_world(RtDraw &d) {
     static const char *kSkip[] = {"InstWorld", "TypeVerts", "TruemmerMats", "SkyBallMtx", "MatHUD", "MatRHW", "TransMtx", "TransMat", "Anim"};
     for (const char *n : kSkip) if (vs->ctab.count(n)) return false;
     const float (*c)[4] = D->st.vsf;
+    // exact world matrices first: WorldMtx (c0), or the track's WorldViewProj when it is just the
+    // camera's ViewProj (the track is in world space, moved by WorldOffset)
+    if (vs->ctab_reg("WorldMtx") == 0) { memcpy(d.m, c[0], 48); d.wvp = false; return true; }
+    int wo = vs->ctab_reg("WorldOffset");
+    // the track (AmbLevel shaders) is in world space: its WorldViewProj is the camera's ViewProj
+    if (vs->ctab.count("AmbLevel") && vs->ctab_reg("WorldViewProjMtx") == 20) {
+        bool same = true;
+        if (D->vp_cur_ok) {
+            float dmax = 0, vmax = 0;
+            for (int k = 0; k < 16; k++) { dmax = std::max(dmax, fabsf(c[20 + k / 4][k & 3] - D->vp_cur[k])); vmax = std::max(vmax, fabsf(D->vp_cur[k])); }
+            same = dmax <= 1e-5f * vmax;
+            static int warned;
+            if (!same && warned++ < 3) rtlog("rt: a track draw has its own world matrix (WorldViewProj differs from ViewProj by %g)", dmax);
+        }
+        if (same) {
+            static const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+            memcpy(d.m, I, 48); d.wvp = false; d.fixed = true;
+            if (wo >= 0 && wo < 256) { d.m[3] = c[wo][0]; d.m[7] = c[wo][1]; d.m[11] = c[wo][2]; }
+            return true;
+        }
+    }
     if (vs->ctab_reg("WorldViewProjMtx") == 20) {
         memcpy(d.m, c[20], 64); d.wvp = true;
-        int wo = vs->ctab_reg("WorldOffset");   // the track adds it to the position first: M * translate(offset)
-        if (wo >= 0 && wo < 256)
+        if (wo >= 0 && wo < 256)   // the track adds it to the position first: M * translate(offset)
             for (int r = 0; r < 4; r++) d.m[r * 4 + 3] += d.m[r * 4] * c[wo][0] + d.m[r * 4 + 1] * c[wo][1] + d.m[r * 4 + 2] * c[wo][2];
         return true;
     }
-    if (vs->ctab_reg("WorldMtx") == 0) { memcpy(d.m, c[0], 48); d.wvp = false; return true; }
     if (vs->ctab_reg("ViewProjMtx") == 16) {   // track geometry: vertices already in world space
         // ...except billboards (distant trees): POSITION1 is the centre, POSITION0 the corner offset
         for (auto &in : vs->sm.inputs) if (in.usage == 0 && in.index == 1) return false;
         static const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-        memcpy(d.m, I, 48); d.wvp = false; return true;
+        memcpy(d.m, I, 48); d.wvp = false; d.fixed = true; return true;
     }
     return false;
 }
@@ -1727,8 +1767,7 @@ static std::string rt_shader_name(Shader *vs) {
     return n.empty() ? "no CTAB" : n;
 }
 static void rt_note(int prim, uint32_t prims, uint32_t first, int32_t base, Buffer *ib, int inst) {
-    static bool rt_on = fvr_option("rt", 0) > 0;
-    if (!D->taa_bound || !rt_capture_active(D->frame, rt_on)) return;
+    if (!D->taa_bound || !rt_capture_active(D->frame, rt_enabled())) return;
     if (inst > 1) { rt_skip(RT_SKIP_INSTANCED); return; }
     RtDraw d{};
     if (!rt_world(d)) { rt_skip(RT_SKIP_SHADER, rt_shader_name(D->st.vs).c_str()); return; }

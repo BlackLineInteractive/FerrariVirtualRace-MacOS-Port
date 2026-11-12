@@ -24,6 +24,7 @@ struct RtDraw {
     uint32_t vb_id, vb_ver;      // identify the geometry: guest address of `pos` and buffer versions
     uint32_t ib_id, ib_ver;
     const char *shader;          // vertex shader's constant names (statistics)
+    bool fixed;                  // world-space track geometry: cannot move
 };
 
 // Why a draw was left out (statistics).
@@ -36,3 +37,7 @@ void rt_capture(const RtDraw &d);
 void rt_skip(RtSkip why, const char *what = nullptr);
 // End of the frame: vp = camera view-projection (rows = clip components), ivp its inverse.
 void rt_frame_end(uint64_t frame, const float *vp, const float *ivp);
+// Builds this frame's TLAS now and traces it on the GPU (Metal): returns an OpenGL rectangle
+// texture (w x h, RGBA16F) with the debug view, or 0.
+// mode 1: the camera's view, 2: looking backwards from the camera
+unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w, int h, int mode);

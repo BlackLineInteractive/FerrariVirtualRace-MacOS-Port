@@ -136,7 +136,8 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 | `FVR_FPS=1` | Print FPS every two seconds, explain slow frames, and log the GPU time of the scene, reflection and temporal passes |
 | `FVR_VSYNC=0` | Turn vertical sync off (benchmarks) |
 | `FVR_REFLECTIONS`, `FVR_BAKED_LIGHT` | Override `reflections` / `baked_light` from `options.txt` |
-| `FVR_RT=1` | Ray-tracing scene (with a `Temporal` mode): keeps a [tinybvh](third_party/tiny_bvh.h) CWBVH per mesh and a TLAS over each frame's draws; `FVR_RT_STATS=1` logs instances, triangles and build times once a second; `FVR_RT_BUDGET` (ms per frame for new meshes, default 6) |
+| `FVR_RT=1` | Ray-tracing scene (with a `Temporal` mode): a [tinybvh](third_party/tiny_bvh.h) CWBVH per mesh, the track remembered after it leaves the view and merged into one world-space CWBVH in the background, and a TLAS over each frame's cars and other draws; `FVR_RT_STATS=1` logs counts and timings once a second; `FVR_RT_BUDGET` (ms per frame for new meshes, default 6); `FVR_RT_WORLD` (frames a track piece must be drawn before it is remembered, default 10) |
+| `FVR_RT_VIEW=1` / `2` | Ray-tracing check on the GPU: Metal traces one ray per pixel through the scene and shows it instead of the game's image (OpenGL reads it through an IOSurface); `2` looks backwards from the camera, at what the game is not drawing |
 | `FVR_RT_DUMP=<seconds>` | Ray-tracing check: traces the first frame after that time on the CPU through the TLAS and every instance's CWBVH from the game's camera (one colour per instance) and saves `rt_dump.ppm` in `FVR_SHOT_DIR` |
 | `FVR_GL_MT=0` | Disable Apple's multithreaded GL engine |
 | `FVR_KEYS` | Scripted key presses `ms:Key[:holdms],...`; the real keyboard and mouse are ignored while set. `9000:Return,12000:Return,15000:Return,18000:Return,21000:Return,24000:Return` drives the menus into a race |

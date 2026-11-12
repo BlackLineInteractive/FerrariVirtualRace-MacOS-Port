@@ -7,6 +7,7 @@
 // geometry, matrices and both levels are right.
 #include "rt_scene.h"
 #include "rt.h"
+#include "rt_metal.h"
 #include <SDL3/SDL.h>
 #include <vector>
 #include <string>
@@ -20,6 +21,9 @@
 #include <unordered_map>
 #include <algorithm>
 #include <tuple>
+#include <thread>
+#include <atomic>
+#include <unordered_set>
 
 #define TINYBVH_IMPLEMENTATION
 #include "../third_party/tiny_bvh.h"
@@ -58,9 +62,10 @@ struct Blas {
     uint32_t tris = 0;
     bvhvec3 lo{1e30f}, hi{-1e30f};
     uint64_t used = 0;           // last frame drawn
+    uint32_t node_base = 0, tri_base = 0;   // in the packed GPU arrays (float4 units)
 };
 static std::unordered_map<MeshKey, std::unique_ptr<Blas>, MeshKeyHash> g_blas;
-struct SlotInfo { uint32_t vbv, ibv, changes; };
+struct SlotInfo { uint32_t vbv, ibv; uint64_t changed; int rapid; bool known; };
 static std::unordered_map<MeshKey, SlotInfo, MeshKeyHash> g_slots;
 
 // ---------------------------------------------------------------- this frame's instances
@@ -69,9 +74,76 @@ struct Inst {
     float m[16];                 // as captured (object -> world 3 rows, or object -> clip)
     bool wvp;
     const char *shader;
+    bool fixed;                  // world-space track geometry (kept in the world memory)
+    bool kept;                   // from the world memory, w / iw already set
     float w[12], iw[12];         // object -> world and world -> object (3x4 rows)
 };
 static std::vector<Inst> g_inst;
+static uint64_t g_built = ~0ull;               // frame whose TLAS is built
+
+// ---------------------------------------------------------------- world memory
+// The game only draws what is in view, but reflections need what is behind the camera too. The
+// track's world-space geometry (RtDraw::fixed: it cannot move) stays in the TLAS after it leaves
+// the view, once it has been drawn in a few frames; cars and everything else come from this frame.
+struct WKey {
+    Blas *b; int32_t q[12];
+    bool operator==(const WKey &o) const { return b == o.b && !memcmp(q, o.q, sizeof q); }
+};
+struct WKeyHash {
+    size_t operator()(const WKey &k) const {
+        uint64_t h = (uint64_t)(uintptr_t)k.b * 0x9E3779B97F4A7C15ull;
+        for (int i = 0; i < 12; i++) h = (h ^ (uint32_t)k.q[i]) * 1099511628211ull;
+        return (size_t)h;
+    }
+};
+struct WorldInst { float w[12], iw[12]; uint64_t seen; uint32_t frames; };
+static std::unordered_map<WKey, WorldInst, WKeyHash> g_world;
+static size_t g_world_kept;                    // persisted instances added to this frame's TLAS
+
+// The remembered track merged into one world-space CWBVH (as the static group of the path tracer):
+// overlapping track pieces as separate TLAS leaves make every ray test hundreds of them. Built in
+// a background thread whenever enough new pieces are known; pieces in it leave the TLAS.
+struct Merge {
+    std::unique_ptr<Blas> blas;
+    std::unordered_set<WKey, WKeyHash> keys;
+    std::vector<bvhvec4> nodes, tris;      // packed for the GPU
+    double ms = 0;
+};
+static std::unique_ptr<Merge> g_merged;
+static Merge *g_merge_job;                     // being built (owned by the worker until done)
+static std::atomic<bool> g_merge_done{false};
+static bool g_merged_new;                      // the GPU needs it
+static uint64_t g_merge_started;
+static size_t g_merge_pending;                 // remembered pieces not merged yet (stats)
+
+static void merge_build(Merge *m) {
+    auto t0 = Clock::now();
+    Blas &b = *m->blas;
+    b.tris = (uint32_t)(b.v.size() / 3);
+    b.idx.resize(b.v.size());
+    for (uint32_t i = 0; i < b.idx.size(); i++) b.idx[i] = i;
+    b.bvh.Build(b.v.data(), b.idx.data(), b.tris);
+    m->nodes.assign(b.bvh.bvh8Data, b.bvh.bvh8Data + b.bvh.usedBlocks);
+    uint32_t tri_blocks = std::max(b.tris, b.bvh.bvh8.idxCount) * 4;
+    m->tris.assign(b.bvh.bvh8Tris, b.bvh.bvh8Tris + tri_blocks);
+    m->ms = ms_since(t0);
+    g_merge_done = true;
+}
+
+static int world_frames() { static int n = -1; if (n < 0) { const char *e = getenv("FVR_RT_WORLD"); n = e ? atoi(e) : 10; } return n; }
+
+// ---------------------------------------------------------------- packed for the GPU
+// Every BLAS's CWBVH nodes and triangles, appended as they are built (the layout the Metal kernel
+// walks); rebuilt from the cache after evictions. g_up_*: how much the GPU already has.
+static std::vector<bvhvec4> g_pnodes, g_ptris;
+static size_t g_up_nodes, g_up_tris;
+static void pack(Blas &b) {
+    b.node_base = (uint32_t)g_pnodes.size();
+    b.tri_base = (uint32_t)g_ptris.size();
+    g_pnodes.insert(g_pnodes.end(), b.bvh.bvh8Data, b.bvh.bvh8Data + b.bvh.usedBlocks);
+    uint32_t tri_blocks = std::max((uint32_t)(b.idx.size() / 3), b.bvh.bvh8.idxCount) * 4;
+    g_ptris.insert(g_ptris.end(), b.bvh.bvh8Tris, b.bvh.bvh8Tris + tri_blocks);
+}
 static tinybvh::BVH g_tlas;
 static std::vector<bvhvec4> g_tlas_aabbs;
 
@@ -160,10 +232,12 @@ void rt_capture(const RtDraw &d) {
     if (it != g_blas.end()) b = it->second.get();
     else {
         SlotInfo &s = g_slots[slot_of(k)];
-        if (s.changes > 0 && (s.vbv != k.vbv || s.ibv != k.ibv)) s.changes++;
-        else if (!s.changes) s.changes = 1;
+        // contents rewritten: occasionally (car damage) gets a new BLAS, every few frames (particles,
+        // debris) is left out until it settles
+        if (!s.known) { s.known = true; s.changed = g_frame; s.rapid = 0; }
+        else if (s.vbv != k.vbv || s.ibv != k.ibv) { s.rapid = g_frame - s.changed <= 8 ? s.rapid + 1 : 0; s.changed = g_frame; }
         s.vbv = k.vbv; s.ibv = k.ibv;
-        if (s.changes > 4) { g_skips[RT_SKIP_VOLATILE]++; return; }   // rewritten all the time (particles, debris)
+        if (s.rapid >= 3 && g_frame - s.changed <= 8) { g_skips[RT_SKIP_VOLATILE]++; return; }
         bool dump = g_dump_state == 1 && g_frame == g_dump_frame;
         if (!dump && g_build_ms > build_budget_ms()) { g_skips[RT_SKIP_BUDGET]++; return; }   // next frame
         auto t0 = Clock::now();
@@ -172,12 +246,13 @@ void rt_capture(const RtDraw &d) {
         g_build_ms += ms_since(t0);
         if (!ok) { g_skips[RT_SKIP_EMPTY]++; return; }
         g_new_blas++; g_new_tris += nb->tris;
+        pack(*nb);
         b = nb.get();
         g_blas.emplace(k, std::move(nb));
     }
     b->used = g_frame;
     Inst in;
-    in.b = b; memcpy(in.m, d.m, 64); in.wvp = d.wvp; in.shader = d.shader;
+    in.b = b; memcpy(in.m, d.m, 64); in.wvp = d.wvp; in.shader = d.shader; in.fixed = d.fixed; in.kept = false;
     g_inst.push_back(in);
     g_draws++;
 }
@@ -206,28 +281,126 @@ static inline bvhvec3 xd(const float *w, const bvhvec3 &v) {
 }
 
 // Object -> world for every instance, then the TLAS over their world bounds.
-static bool build_tlas(const float *ivp) {
+// Inverse of a 4x4 (rows) in double precision; false if singular.
+static bool inv4d(const float *m, double *r) {
+    double a[4][8];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 8; j++) a[i][j] = j < 4 ? m[i * 4 + j] : (j - 4 == i);
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int i = c + 1; i < 4; i++) if (fabs(a[i][c]) > fabs(a[p][c])) p = i;
+        if (fabs(a[p][c]) < 1e-30) return false;
+        if (p != c) for (int j = 0; j < 8; j++) std::swap(a[p][j], a[c][j]);
+        double iv = 1.0 / a[c][c];
+        for (int j = 0; j < 8; j++) a[c][j] *= iv;
+        for (int i = 0; i < 4; i++) if (i != c) { double f = a[i][c]; for (int j = 0; j < 8; j++) a[i][j] -= f * a[c][j]; }
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) r[i * 4 + j] = a[i][j + 4];
+    return true;
+}
+
+static bool build_tlas(const float *vp) {
+    double ivp[16];
+    if (!inv4d(vp, ivp)) return false;
     g_tlas_aabbs.clear();
     size_t n = 0;
+    const uint64_t frame = g_frame;
     for (size_t i = 0; i < g_inst.size(); i++) {
         Inst &in = g_inst[i];
         if (in.wvp) {   // world = inverse(camera) * WorldViewProj; the bottom row is (0 0 0 1) up to rounding
-            float w[16]; mul4(ivp, in.m, w);
-            float s = fabsf(w[15]) > 1e-12f ? 1.0f / w[15] : 1.0f;
-            for (int k = 0; k < 12; k++) in.w[k] = w[k] * s;
+            double w[16];
+            for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) {
+                double v = 0; for (int k = 0; k < 4; k++) v += ivp[r * 4 + k] * in.m[k * 4 + c]; w[r * 4 + c] = v;
+            }
+            double s = fabs(w[15]) > 1e-12 ? 1.0 / w[15] : 1.0;
+            for (int k = 0; k < 12; k++) in.w[k] = (float)(w[k] * s);
         } else memcpy(in.w, in.m, 48);
         if (!inv34(in.w, in.iw)) continue;
+        g_inst[n++] = in;
+    }
+    g_inst.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        Inst &in = g_inst[i];
+        Blas *b = in.b;
+        if (in.fixed) {
+            WKey k; k.b = b;
+            for (int j = 0; j < 12; j++) k.q[j] = (int32_t)lrintf(in.w[j] * ((j & 3) == 3 ? 10.0f : 100.0f));
+            if (g_merged && g_merged->keys.count(k)) in.kept = true;   // already in the merged track: dropped below
+            auto it = g_world.find(k);
+            if (it == g_world.end()) {
+                WorldInst wi; memcpy(wi.w, in.w, 48); memcpy(wi.iw, in.iw, 48); wi.seen = frame; wi.frames = 1;
+                g_world.emplace(k, wi);
+            } else if (it->second.seen != frame) { it->second.seen = frame; it->second.frames++; }
+        }
+    }
+    // static placements not drawn this frame
+    // the merged track: take a finished build, drop the pieces it holds
+    if (g_merge_done) {
+        g_merge_done = false;
+        g_merged.reset(g_merge_job);
+        g_merge_job = nullptr;
+        g_merged_new = true;
+        if (stats_on()) rtlog("rt: merged track rebuilt: %zu pieces, %u triangles, %.0f ms in the background", g_merged->keys.size(), g_merged->blas->tris, g_merged->ms);
+    }
+    {
+        size_t m = 0;
+        for (size_t i = 0; i < n; i++) if (!(g_inst[i].fixed && g_inst[i].kept)) g_inst[m++] = g_inst[i];
+        g_inst.resize(m);
+    }
+    g_world_kept = 0;
+    g_merge_pending = 0;
+    size_t established = 0;
+    for (auto it = g_world.begin(); it != g_world.end();) {
+        WorldInst &w = it->second;
+        Blas *b = it->first.b;
+        if ((w.frames < (uint32_t)world_frames() && frame - w.seen > 2)) { it = g_world.erase(it); continue; }
+        bool merged = g_merged && g_merged->keys.count(it->first);
+        if (w.frames >= (uint32_t)world_frames()) { established++; if (!merged) g_merge_pending++; it->first.b->used = frame; }
+        if (w.seen != frame && w.frames >= (uint32_t)world_frames() && !merged) {
+            Inst in; in.b = b; in.wvp = false; in.shader = "world memory"; in.fixed = true; in.kept = true;
+            memcpy(in.w, w.w, 48); memcpy(in.iw, w.iw, 48);
+            b->used = frame;
+            g_inst.push_back(in);
+            g_world_kept++;
+        }
+        ++it;
+    }
+    if (g_merged) {
+        Inst in; in.b = g_merged->blas.get(); in.wvp = false; in.shader = "merged track"; in.fixed = false; in.kept = true;
+        static const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        memcpy(in.w, I, 48); memcpy(in.iw, I, 48);
+        g_inst.push_back(in);
+    }
+    // start a new merge when enough new pieces are known (at most once a second)
+    if (!g_merge_job && g_merge_pending >= 32 && SDL_GetTicks() - g_merge_started >= 1000) {
+        g_merge_started = SDL_GetTicks();
+        Merge *m = new Merge;
+        m->blas = std::make_unique<Blas>();
+        Blas &mb = *m->blas;
+        for (auto &e : g_world) {
+            if (e.second.frames < (uint32_t)world_frames()) continue;
+            m->keys.insert(e.first);
+            const Blas &b = *e.first.b;
+            for (uint32_t t = 0; t < b.tris * 3; t++) {
+                bvhvec3 p = xp(e.second.w, bvhvec3(b.v[b.idx[t]]));
+                mb.v.push_back(bvhvec4(p.x, p.y, p.z, 0));
+                mb.lo = tinybvh::tinybvh_min(mb.lo, p); mb.hi = tinybvh::tinybvh_max(mb.hi, p);
+            }
+        }
+        if (mb.v.size() >= 12) { g_merge_job = m; std::thread(merge_build, m).detach(); }
+        else delete m;
+    }
+    n = g_inst.size();
+    for (size_t i = 0; i < n; i++) {
+        const Inst &in = g_inst[i];
         bvhvec3 lo(1e30f), hi(-1e30f);
         for (int c = 0; c < 8; c++) {
             bvhvec3 p((c & 1) ? in.b->hi.x : in.b->lo.x, (c & 2) ? in.b->hi.y : in.b->lo.y, (c & 4) ? in.b->hi.z : in.b->lo.z);
             p = xp(in.w, p);
             lo = tinybvh::tinybvh_min(lo, p); hi = tinybvh::tinybvh_max(hi, p);
         }
-        g_inst[n++] = in;
         g_tlas_aabbs.push_back(bvhvec4(lo.x, lo.y, lo.z, 0));
         g_tlas_aabbs.push_back(bvhvec4(hi.x, hi.y, hi.z, 0));
     }
-    g_inst.resize(n);
     if (n < 2) return false;
     g_tlas.BuildAABB(g_tlas_aabbs.data(), (uint32_t)n);
     return true;
@@ -236,8 +409,13 @@ static bool build_tlas(const float *ivp) {
 // Frees BLASes that have not been drawn for a while (meshes of other places on the track stay).
 static void evict(uint64_t frame) {
     if (frame % 600) return;
+    size_t before = g_blas.size();
     for (auto it = g_blas.begin(); it != g_blas.end();)
         if (frame - it->second->used > 3600) it = g_blas.erase(it); else ++it;
+    if (g_blas.size() != before) {   // repack what is left
+        g_pnodes.clear(); g_ptris.clear(); g_up_nodes = g_up_tris = 0;
+        for (auto &k : g_blas) pack(*k.second);
+    }
     if (g_slots.size() > 200000) g_slots.clear();
 }
 
@@ -373,10 +551,10 @@ static void dump(const float *ivp) {
 }
 
 void rt_frame_end(uint64_t frame, const float *vp, const float *ivp) {
-    (void)vp;
     if (frame != g_frame) return;
     auto t0 = Clock::now();
-    bool ok = build_tlas(ivp);
+    bool ok = g_built == frame ? g_inst.size() >= 2 : build_tlas(vp);
+    g_built = frame;
     double tlas_ms = ms_since(t0);
     static uint64_t last_log;
     if (stats_on() && SDL_GetTicks() - last_log >= 1000) {
@@ -394,4 +572,37 @@ void rt_frame_end(uint64_t frame, const float *vp, const float *ivp) {
     }
     g_build_ms = 0;
     evict(frame);
+}
+
+// The GPU view (FVR_RT_VIEW): this frame's TLAS, built now (the scene pass is done), and one primary
+// ray per pixel traced by Metal into an image OpenGL can read.
+unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w, int h, int mode) {
+    if (frame != g_frame || !rtm_available()) return 0;
+    auto t0 = Clock::now();
+    if (g_built != frame) { g_built = frame; if (!build_tlas(vp)) g_inst.clear(); }
+    double tlas_ms = ms_since(t0);
+    if (g_inst.empty() || g_pnodes.empty()) return 0;
+    t0 = Clock::now();
+    rtm_blas(g_pnodes.data(), g_pnodes.size(), g_up_nodes, g_ptris.data(), g_ptris.size(), g_up_tris);
+    g_up_nodes = g_pnodes.size(); g_up_tris = g_ptris.size();
+    if (g_merged_new && g_merged) { rtm_merged(g_merged->nodes.data(), g_merged->nodes.size(), g_merged->tris.data(), g_merged->tris.size()); g_merged_new = false; }
+    static std::vector<RtmInst> gi;
+    gi.resize(g_inst.size());
+    for (size_t i = 0; i < g_inst.size(); i++) {
+        memcpy(gi[i].w2o, g_inst[i].iw, 48);
+        bool merged = g_merged && g_inst[i].b == g_merged->blas.get();
+        gi[i].node_base = merged ? 0 : g_inst[i].b->node_base;
+        gi[i].tri_base = merged ? 0 : g_inst[i].b->tri_base;
+        gi[i].tint = 0; gi[i].pad = merged;
+    }
+    double gpu = 0;
+    unsigned tex = rtm_trace_view(gi.data(), gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), ivp, w, h, mode, &gpu);
+    double all = ms_since(t0);
+    static uint64_t last;
+    if (stats_on() && SDL_GetTicks() - last >= 1000) {
+        last = SDL_GetTicks();
+        rtlog("rt: GPU view %dx%d: Metal %.2f ms (wall %.2f ms incl. upload), TLAS %.2f ms, %zu instances (%zu remembered, %zu waiting for the merge, merged track %u triangles), BLAS data %.1f MB",
+              w, h, gpu, all, tlas_ms, g_inst.size(), g_world_kept, g_merge_pending, g_merged ? g_merged->blas->tris : 0, (g_pnodes.size() + g_ptris.size()) * 16 / 1048576.0);
+    }
+    return tex;
 }

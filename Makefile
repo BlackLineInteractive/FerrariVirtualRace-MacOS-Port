@@ -9,8 +9,8 @@ CXXFLAGS= $(ARCH) -O1 -g -std=c++17 -Iruntime -Wall -Wno-unused-function -Wno-un
 GEN_SRC = $(wildcard gen/*.c)
 GEN_OBJ = $(patsubst gen/%.c,build/obj/%.o,$(GEN_SRC))
 RT_SRC  = $(wildcard runtime/*.cpp)
-RT_OBJ  = $(patsubst runtime/%.cpp,build/rt/%.o,$(RT_SRC))
-LIBS    = $(shell pkg-config --libs sdl3 2>/dev/null) -framework OpenGL -framework Cocoa -framework ImageIO -framework CoreGraphics
+RT_OBJ  = $(patsubst runtime/%.cpp,build/rt/%.o,$(RT_SRC)) build/rt/rt_metal.o
+LIBS    = $(shell pkg-config --libs sdl3 2>/dev/null) -framework OpenGL -framework Cocoa -framework ImageIO -framework CoreGraphics -framework Metal -framework IOSurface -framework Foundation
 
 build/fvr: $(GEN_OBJ) $(RT_OBJ)
 	$(CXX) $(ARCH) -o $@ $^ $(LIBS)
@@ -28,6 +28,11 @@ build/obj/%.o: gen/%.c runtime/cpu.h
 build/rt/%.o: runtime/%.cpp runtime/rt.h runtime/cpu.h runtime/win32ui.h
 	@mkdir -p build/rt
 	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags sdl3 2>/dev/null) -c $< -o $@
+
+# Metal ray tracing (Objective-C++)
+build/rt/rt_metal.o: runtime/rt_metal.mm runtime/rt_metal.h runtime/rt.h
+	@mkdir -p build/rt
+	$(CXX) $(CXXFLAGS) -fobjc-arc -c $< -o $@
 
 gen: tools/recomp.py tools/fpu.py
 	rm -rf gen build/obj

@@ -8,7 +8,7 @@
 - Temporal AA and temporal upscaling (1.5x, 2x) in the style of FSR 2, with per-object motion vectors rebuilt from the previous frame's shader constants
 - Screen-space reflections on the track surface and ground-truth ambient occlusion (GTAO), both optional in `options.txt`
 - Options to turn off the game's own cube-map reflections (half of the draw calls) and its baked track lighting
-- Ray-tracing scene on the CPU: a tinybvh CWBVH per mesh (cached, built within a per-frame budget) and a TLAS over each frame's draws (about 1 ms), checked against the game's frame
+- Ray-tracing scene: a tinybvh CWBVH per mesh, the remembered track merged into one CWBVH in the background, a TLAS per frame, traced by Metal compute next to OpenGL (IOSurface), checked against the game's frame
 - Resolutions up to 4K and the native Retina size
 - Device re-creation after changing video settings
 - `FerrariVR.app` bundle with SDL3 inside, game-folder picker, log file
@@ -31,7 +31,11 @@
 
 Mirror-like reflections on the car paint and real refraction and reflection through the windows need rays traced against the actual scene, not the screen. OpenGL 4.1 on macOS has neither compute shaders nor ray-tracing support, so this comes after the Metal backend:
 
-Status: the scene capture and both levels of the acceleration structure work on the CPU (about 1,350 instances and 330,000 triangles at the start line; TLAS about 1 ms per frame). Not captured yet: instanced trees, camera-facing tree billboards (their centre is `POSITION1`), grass, the sky, debris, and the alpha masks of fences. Next: the Metal device with an IOSurface bridge to OpenGL, a Metal port of the CWBVH traversal, and a GPU view of the primary rays.
+Status:
+- **Scene.** Captured from the scene pass with exact world matrices (`WorldMtx`, or the track's `WorldOffset`); a CWBVH per mesh, built once and cached. The track is remembered after it leaves the view, so reflections can show what is behind the camera, and merged in a background thread into one world-space CWBVH (about 500,000 triangles, 0.2-0.3 s per rebuild); the TLAS holds that, the cars and anything else drawn this frame (about 150-300 instances, 0.4 ms on the CPU).
+- **GPU.** Metal compute on the Radeon Pro 5500M next to OpenGL, sharing an RGBA16F image through an IOSurface, with a CWBVH / TLAS traversal ported from an existing Metal path tracer. Primary rays at 960x540 take a median of 2-4 ms (`FVR_RT_VIEW`).
+- **Not captured yet:** instanced trees, camera-facing tree billboards (their centre is `POSITION1`), grass, the sky, debris, and the alpha masks of fences.
+- **Next:** reflection rays from the game's depth and normals for the car paint (mask from the car shaders) and the track, with materials (diffuse texture at the hit point), composited before the temporal pass; then glass.
 
 1. **Scene capture.** The port already sees every draw: vertex and index buffers, the vertex declaration and, per draw, the world matrix (`WorldMtx` c0) and the previous frame's match used for motion vectors. Each distinct mesh becomes a bottom-level acceleration structure (built once, refitted for the cars' moving parts) and each frame's draws an instance list for the top level.
 2. **Materials.** Rays need albedo, normals and textures at the hit point: the diffuse texture bound to sampler 0 and the material constants of each draw, recorded together with the instance.

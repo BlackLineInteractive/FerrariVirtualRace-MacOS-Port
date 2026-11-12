@@ -1,0 +1,341 @@
+// Metal side of the ray tracer (see rt_metal.h). The traversal kernels follow the CWBVH (BVH8)
+// and BVH2 TLAS walk of an existing Metal path tracer (Scene.metal), on tinybvh's data layouts.
+#define GL_SILENCE_DEPRECATION
+#import <Metal/Metal.h>
+#import <IOSurface/IOSurface.h>
+#import <Foundation/Foundation.h>
+#include <OpenGL/OpenGL.h>
+#include <OpenGL/CGLIOSurface.h>
+#include <OpenGL/gl3.h>
+#include "rt_metal.h"
+#include "rt.h"
+#include <cstring>
+
+static const char *kSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Inst { float4 r0, r1, r2; uint nodeBase, triBase, tint, pad; };
+struct TNode { float4 mn; float4 mx; };          // .w: leftFirst / triCount (uint bits)
+struct Params { float4 ivp[4]; uint w, h, nInst, mode; };   // mode 2: look backwards
+
+constant uint kCwStack = 32;
+constant uint kTlasStack = 32;
+
+// Four children of a CWBVH node against the ray: bits for the ones it meets.
+inline uint cwTestQuad(uint meta4, uint loxSource, uint hixSource, uint loySource, uint hiySource, uint lozSource, uint hizSource,
+                       bool3 negDir, uint octinv, float3 adjustedIdir, float3 orig, float tmin, float tMax) {
+    const uint isInner4   = (meta4 & (meta4 << 1u)) & 0x10101010u;
+    const uint innerMask4 = as_type<uint>(as_type<char4>(isInner4 << 3u) >> 7);
+    const uint bitIndex4  = (meta4 ^ (octinv & innerMask4)) & 0x1F1F1F1Fu;
+    const uint childBits4 = (meta4 >> 5u) & 0x07070707u;
+    const float4 lox = float4(as_type<uchar4>(negDir.x ? hixSource : loxSource));
+    const float4 loy = float4(as_type<uchar4>(negDir.y ? hiySource : loySource));
+    const float4 loz = float4(as_type<uchar4>(negDir.z ? hizSource : lozSource));
+    const float4 hix = float4(as_type<uchar4>(negDir.x ? loxSource : hixSource));
+    const float4 hiy = float4(as_type<uchar4>(negDir.y ? loySource : hiySource));
+    const float4 hiz = float4(as_type<uchar4>(negDir.z ? lozSource : hizSource));
+    const float4 cmin = max(max(max(lox * adjustedIdir.x + orig.x, loy * adjustedIdir.y + orig.y),
+                                loz * adjustedIdir.z + orig.z), tmin);
+    const float4 cmax = min(min(min(hix * adjustedIdir.x + orig.x, hiy * adjustedIdir.y + orig.y),
+                                hiz * adjustedIdir.z + orig.z), tMax);
+    const uint4 contribution = uint4(as_type<uchar4>(childBits4)) << uint4(as_type<uchar4>(bitIndex4));
+    const uint4 accepted = select(uint4(0u), contribution, cmin <= cmax);
+    return accepted.x | accepted.y | accepted.z | accepted.w;
+}
+
+struct Hit { float t; float3 n; uint inst; };    // n: object-space geometric normal (unnormalised)
+
+bool intersectBlas(device const float4 *nodes, device const float4 *tris, uint nodeBase, uint triBase,
+                   float3 O, float3 D, float3 rD, float tMin, thread float &tMax, thread Hit &hit, uint instance) {
+    uint stack[kCwStack];
+    uint sp = 0;
+    bool found = false;
+    const bool3  negDir = rD < 0.0f;
+    const float3 Ord   = O * rD;
+    const uint octinv = (7u - ((D.x < 0.0f ? 4u : 0u) | (D.y < 0.0f ? 2u : 0u) | (D.z < 0.0f ? 1u : 0u))) * 0x01010101u;
+    uint2 ngroup = uint2(0u, 0x80000000u);
+    uint2 tgroup = uint2(0u, 0u);
+    while (true) {
+        if (ngroup.y > 0x00FFFFFFu) {
+            const uint imask = ngroup.y;
+            const uint childBit = 31u - clz(imask);
+            const uint childBase = ngroup.x;
+            ngroup.y &= ~(1u << childBit);
+            if (ngroup.y > 0x00FFFFFFu && sp + 2u <= kCwStack) { stack[sp++] = ngroup.x; stack[sp++] = ngroup.y; }
+            const uint slot = (childBit - 24u) ^ (octinv & 255u);
+            const uint base = nodeBase + (childBase + popcount(imask & ~(0xFFFFFFFFu << slot))) * 5u;
+            const float4 n0 = nodes[base], n1 = nodes[base + 1u], n2 = nodes[base + 2u];
+            const float4 n3 = nodes[base + 3u], n4 = nodes[base + 4u];
+            const char4 exponents = as_type<char4>(n0.w);
+            ngroup.x = as_type<uint>(n1.x);
+            tgroup.x = as_type<uint>(n1.y);
+            const float3 adjustedIdir = ldexp(rD, int3(exponents.xyz));
+            const float3 orig = n0.xyz * rD - Ord;
+            const uint hitmask = cwTestQuad(as_type<uint>(n1.z), as_type<uint>(n2.x), as_type<uint>(n3.z), as_type<uint>(n2.z),
+                                            as_type<uint>(n4.x), as_type<uint>(n3.x), as_type<uint>(n4.z),
+                                            negDir, octinv, adjustedIdir, orig, tMin, tMax) |
+                                 cwTestQuad(as_type<uint>(n1.w), as_type<uint>(n2.y), as_type<uint>(n3.w), as_type<uint>(n2.w),
+                                            as_type<uint>(n4.y), as_type<uint>(n3.y), as_type<uint>(n4.w),
+                                            negDir, octinv, adjustedIdir, orig, tMin, tMax);
+            ngroup.y = (hitmask & 0xFF000000u) | (as_type<uint>(n0.w) >> 24u);
+            tgroup.y = hitmask & 0x00FFFFFFu;
+        } else {
+            tgroup = ngroup;
+            ngroup = uint2(0u, 0u);
+        }
+        while (tgroup.y != 0u) {
+            const uint triangle = 31u - clz(tgroup.y);
+            tgroup.y -= 1u << triangle;
+            const uint at = triBase + tgroup.x + triangle * 3u;
+            const float3 e2 = tris[at].xyz, e1 = tris[at + 1u].xyz;
+            const float4 v0 = tris[at + 2u];
+            const float3 h = cross(D, e2);
+            const float a = dot(e1, h);
+            if (abs(a) < 1e-12f) continue;
+            const float f = 1.0f / a;
+            const float3 s = O - v0.xyz;
+            const float u = f * dot(s, h);
+            if (u < 0.0f || u > 1.0f) continue;
+            const float3 q = cross(s, e1);
+            const float v = f * dot(D, q);
+            if (v < 0.0f || u + v > 1.0f) continue;
+            const float t = f * dot(e2, q);
+            if (t <= tMin || t >= tMax) continue;
+            tMax = t;
+            hit.t = t; hit.n = cross(e1, e2); hit.inst = instance;
+            found = true;
+        }
+        if (ngroup.y > 0x00FFFFFFu) continue;
+        if (sp == 0u) break;
+        ngroup.y = stack[--sp];
+        ngroup.x = stack[--sp];
+    }
+    return found;
+}
+
+bool traceTlas(device const float4 *nodes, device const float4 *tris, device const float4 *mnodes, device const float4 *mtris,
+               device const TNode *tlas, device const uint *prims, device const Inst *insts, float3 origin, float3 direction, float tMin, thread float &tMax, thread Hit &hit) {
+    const float3 rD = 1.0f / select(direction, float3(1e-20f), abs(direction) < 1e-20f);
+    uint stack[kTlasStack];
+    uint sp = 0, nodeIdx = 0;
+    bool found = false;
+    while (true) {
+        const TNode node = tlas[nodeIdx];
+        const uint leftFirst = as_type<uint>(node.mn.w);
+        const uint triCount  = as_type<uint>(node.mx.w);
+        if (triCount > 0u) {
+            for (uint i = 0u; i < triCount; i++) {
+                const uint ii = prims[leftFirst + i];
+                const Inst in = insts[ii];
+                const float4 o4 = float4(origin, 1.0f), d4 = float4(direction, 0.0f);
+                const float3 O = float3(dot(in.r0, o4), dot(in.r1, o4), dot(in.r2, o4));
+                const float3 D = float3(dot(in.r0, d4), dot(in.r1, d4), dot(in.r2, d4));
+                const float3 iD = 1.0f / select(D, float3(1e-20f), abs(D) < 1e-20f);
+                if (in.pad ? intersectBlas(mnodes, mtris, 0u, 0u, O, D, iD, tMin, tMax, hit, ii)
+                           : intersectBlas(nodes, tris, in.nodeBase, in.triBase, O, D, iD, tMin, tMax, hit, ii)) found = true;
+            }
+        } else {
+            const uint childA = leftFirst, childB = leftFirst + 1u;
+            const TNode a = tlas[childA], b = tlas[childB];
+            float3 t1 = (a.mn.xyz - origin) * rD, t2 = (a.mx.xyz - origin) * rD;
+            float3 lo = min(t1, t2), hi = max(t1, t2);
+            float tA = max(max(max(lo.x, lo.y), lo.z), tMin), hA = min(min(min(hi.x, hi.y), hi.z), tMax);
+            float distA = (tA > hA) ? 1e30f : tA;
+            t1 = (b.mn.xyz - origin) * rD; t2 = (b.mx.xyz - origin) * rD;
+            lo = min(t1, t2); hi = max(t1, t2);
+            float tB = max(max(max(lo.x, lo.y), lo.z), tMin), hB = min(min(min(hi.x, hi.y), hi.z), tMax);
+            float distB = (tB > hB) ? 1e30f : tB;
+            uint nearC = childA, farC = childB;
+            if (distB < distA) { nearC = childB; farC = childA; const float s = distA; distA = distB; distB = s; }
+            if (distA < 1e30f) {
+                if (distB < 1e30f && sp < kTlasStack) stack[sp++] = farC;
+                nodeIdx = nearC;
+                continue;
+            }
+        }
+        if (sp == 0u) break;
+        nodeIdx = stack[--sp];
+    }
+    return found;
+}
+
+// Debug view: one primary ray per pixel, shaded by the angle to the surface, one tint per instance.
+kernel void rt_view(device const float4 *nodes [[buffer(0)]], device const float4 *tris [[buffer(1)]],
+                    device const TNode *tlas [[buffer(2)]], device const uint *prims [[buffer(3)]],
+                    device const Inst *insts [[buffer(4)]], constant Params &P [[buffer(5)]],
+                    device const float4 *mnodes [[buffer(6)]], device const float4 *mtris [[buffer(7)]],
+                    texture2d<half, access::write> out [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= P.w || gid.y >= P.h) return;
+    const float x = (float(gid.x) + 0.5f) / float(P.w) * 2.0f - 1.0f;
+    const float y = 1.0f - (float(gid.y) + 0.5f) / float(P.h) * 2.0f;
+    const float4 pn = float4(x, y, 0.0f, 1.0f), pf = float4(x, y, 1.0f, 1.0f);
+    const float4 a = float4(dot(P.ivp[0], pn), dot(P.ivp[1], pn), dot(P.ivp[2], pn), dot(P.ivp[3], pn));
+    const float4 b = float4(dot(P.ivp[0], pf), dot(P.ivp[1], pf), dot(P.ivp[2], pf), dot(P.ivp[3], pf));
+    const float3 O = a.xyz / a.w, E = b.xyz / b.w;
+    float3 D = E - O;
+    if (P.mode == 2u) D = float3(-D.x, D.y, -D.z);   // turned around (world is Y-up)
+    const float len = length(D);
+    D /= len;
+    float tMax = len;
+    Hit hit; hit.t = len; hit.n = float3(0, 1, 0); hit.inst = 0xFFFFFFFFu;
+    half4 c;
+    if (P.nInst == 0u || !traceTlas(nodes, tris, mnodes, mtris, tlas, prims, insts, O, D, 0.0f, tMax, hit)) {
+        c = half4(0.35h, 0.47h, 0.63h, 1.0h);
+    } else {
+        const Inst in = insts[hit.inst];
+        // object -> world for a normal: transpose of world -> object
+        const float3 n = normalize(hit.n.x * in.r0.xyz + hit.n.y * in.r1.xyz + hit.n.z * in.r2.xyz);
+        const float sh = abs(dot(n, D)), up = abs(n.y);
+        const float fog = exp(-hit.t * 0.0015f);
+        const uint hc = hit.inst * 2654435761u;
+        const float3 tint = 0.75f + 0.25f * float3((hc >> 8) & 255u, (hc >> 16) & 255u, (hc >> 24) & 255u) / 255.0f;
+        c = half4(half3(fog * tint * float3(0.15f + 0.6f * sh, 0.15f + 0.6f * sh * (0.6f + 0.4f * up), 0.15f + 0.45f * sh)), 1.0h);
+    }
+    out.write(c, gid);
+}
+)MSL";
+
+namespace {
+struct State {
+    bool tried = false, ok = false;
+    id<MTLDevice> dev;
+    id<MTLCommandQueue> queue;
+    id<MTLComputePipelineState> view;
+    id<MTLBuffer> nodes, tris;                 // BLAS data, grown as needed
+    id<MTLBuffer> mnodes, mtris;               // the merged world-space BLAS
+    id<MTLBuffer> frame[3];                    // instances, TLAS nodes, TLAS leaf indices
+    // output image shared with OpenGL
+    IOSurfaceRef surf = nullptr;
+    id<MTLTexture> tex;
+    GLuint gltex = 0;
+    int w = 0, h = 0;
+};
+State S;
+
+bool init() {
+    if (S.tried) return S.ok;
+    S.tried = true;
+    @autoreleasepool {
+        NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+        for (id<MTLDevice> d in all) {
+            rtlog("rt: Metal device %s%s", d.name.UTF8String, d.lowPower ? " (low power)" : "");
+            if (!S.dev || (S.dev.lowPower && !d.lowPower)) S.dev = d;
+        }
+        if (!S.dev) { rtlog("rt: no Metal device"); return false; }
+        S.queue = [S.dev newCommandQueue];
+        NSError *err = nil;
+        MTLCompileOptions *opt = [MTLCompileOptions new];
+        opt.mathMode = MTLMathModeFast;
+        id<MTLLibrary> lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:kSource] options:opt error:&err];
+        if (!lib) { rtlog("rt: Metal kernel compile failed: %s", err.localizedDescription.UTF8String); return false; }
+        S.view = [S.dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rt_view"] error:&err];
+        if (!S.view) { rtlog("rt: Metal pipeline failed: %s", err.localizedDescription.UTF8String); return false; }
+        rtlog("rt: Metal ray tracing on %s", S.dev.name.UTF8String);
+        S.ok = true;
+    }
+    return true;
+}
+
+// a managed buffer of at least `bytes`; contents are kept only if `keep` (copied by the caller otherwise)
+id<MTLBuffer> ensure(id<MTLBuffer> b, size_t bytes, bool *grew) {
+    *grew = false;
+    if (b && b.length >= bytes) return b;
+    size_t cap = b ? b.length : 1 << 16;
+    while (cap < bytes) cap *= 2;
+    *grew = true;
+    return [S.dev newBufferWithLength:cap options:MTLResourceStorageModeManaged];
+}
+void upload(id<MTLBuffer> b, const void *src, size_t from, size_t to) {
+    if (to <= from) return;
+    memcpy((uint8_t *)b.contents + from, (const uint8_t *)src + from, to - from);
+    [b didModifyRange:NSMakeRange(from, to - from)];
+}
+
+bool ensure_image(int w, int h) {
+    if (S.surf && S.w == w && S.h == h) return true;
+    if (S.gltex) { glDeleteTextures(1, &S.gltex); S.gltex = 0; }
+    if (S.surf) { CFRelease(S.surf); S.surf = nullptr; }
+    S.tex = nil;
+    NSDictionary *props = @{(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @8,
+                            (id)kIOSurfacePixelFormat: @((uint32_t)'RGhA')};
+    S.surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!S.surf) { rtlog("rt: IOSurface %dx%d failed", w, h); return false; }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModeManaged;
+    S.tex = [S.dev newTextureWithDescriptor:d iosurface:S.surf plane:0];
+    if (!S.tex) { rtlog("rt: Metal texture over IOSurface failed"); return false; }
+    GLint prev = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prev);
+    glGenTextures(1, &S.gltex);
+    glBindTexture(GL_TEXTURE_RECTANGLE, S.gltex);
+    CGLError e = CGLTexImageIOSurface2D(CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE, GL_RGBA16F, w, h, GL_RGBA, GL_HALF_FLOAT, S.surf, 0);
+    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_RECTANGLE, prev);
+    if (e != kCGLNoError) { rtlog("rt: CGLTexImageIOSurface2D failed: %d", (int)e); glDeleteTextures(1, &S.gltex); S.gltex = 0; return false; }
+    S.w = w; S.h = h;
+    rtlog("rt: shared %dx%d RGBA16F image between Metal and OpenGL", w, h);
+    return true;
+}
+}   // namespace
+
+bool rtm_available() { return init(); }
+
+void rtm_blas(const void *nodes, size_t n_nodes, size_t from_nodes, const void *tris, size_t n_tris, size_t from_tris) {
+    if (!init()) return;
+    bool grew;
+    S.nodes = ensure(S.nodes, n_nodes * 16 + 16, &grew);
+    upload(S.nodes, nodes, grew ? 0 : from_nodes * 16, n_nodes * 16);
+    S.tris = ensure(S.tris, n_tris * 16 + 16, &grew);
+    upload(S.tris, tris, grew ? 0 : from_tris * 16, n_tris * 16);
+}
+
+void rtm_merged(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris) {
+    if (!init()) return;
+    bool grew;
+    S.mnodes = ensure(S.mnodes, n_nodes * 16 + 16, &grew);
+    upload(S.mnodes, nodes, 0, n_nodes * 16);
+    S.mtris = ensure(S.mtris, n_tris * 16 + 16, &grew);
+    upload(S.mtris, tris, 0, n_tris * 16);
+}
+
+unsigned rtm_trace_view(const RtmInst *inst, size_t n_inst, const void *tlas_nodes, size_t n_tlas, const uint32_t *prim, size_t n_prim,
+                        const float *ivp, int w, int h, int mode, double *gpu_ms) {
+    if (!init() || !S.nodes || !S.tris || !ensure_image(w, h)) return 0;
+    @autoreleasepool {
+        const void *src[3] = {inst, tlas_nodes, prim};
+        size_t bytes[3] = {n_inst * sizeof(RtmInst), n_tlas * 32, n_prim * 4};
+        for (int i = 0; i < 3; i++) {
+            bool grew;
+            S.frame[i] = ensure(S.frame[i], bytes[i] + 64, &grew);
+            upload(S.frame[i], src[i], 0, bytes[i]);
+        }
+        struct { float ivp[16]; uint32_t w, h, n, mode; } P;
+        memcpy(P.ivp, ivp, 64);
+        P.w = w; P.h = h; P.n = (uint32_t)n_inst; P.mode = (uint32_t)mode;
+        id<MTLCommandBuffer> cb = [S.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:S.view];
+        [enc setBuffer:S.nodes offset:0 atIndex:0];
+        [enc setBuffer:S.tris offset:0 atIndex:1];
+        [enc setBuffer:S.frame[1] offset:0 atIndex:2];
+        [enc setBuffer:S.frame[2] offset:0 atIndex:3];
+        [enc setBuffer:S.frame[0] offset:0 atIndex:4];
+        [enc setBytes:&P length:sizeof P atIndex:5];
+        [enc setBuffer:(S.mnodes ? S.mnodes : S.nodes) offset:0 atIndex:6];
+        [enc setBuffer:(S.mtris ? S.mtris : S.tris) offset:0 atIndex:7];
+        [enc setTexture:S.tex atIndex:0];
+        [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            rtlog("rt: Metal command buffer failed: %s", cb.error.localizedDescription.UTF8String);
+            return 0;
+        }
+        if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    }
+    return S.gltex;
+}
