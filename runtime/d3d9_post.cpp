@@ -704,3 +704,138 @@ GLuint post_ssr(GLuint col, GLuint dep, int w, int h, const float *vp, const flo
     glActiveTexture(GL_TEXTURE0); glBindSampler(0, 0); glBindTexture(GL_TEXTURE_2D, 0);
     return g_ssr.tex;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ground-truth ambient occlusion (GTAO, Jimenez et al. 2016) at render resolution, before the
+// reflections and temporal accumulation (which averages the per-frame slice rotation). Positions
+// come from depth and the inverse view-projection (world space; the game's units are well below a
+// metre, the default radius of 25 is about a car's height), the normal from
+// neighbouring depths. The game hands over finished lighting, so occlusion darkens the final
+// colour (mostly ambient-lit areas: under cars, between grandstand seats, at wall bases).
+static const char *kAoFS = R"(#version 410 core
+uniform sampler2D col, dep;
+uniform mat4 IVP;
+uniform vec3 cam;
+uniform vec2 size;
+uniform float strength, radius, projScale, seed;
+uniform int dbg;
+layout(location = 0) out vec4 o;
+const float PI = 3.14159265;
+vec3 wpos(vec2 uv, float z) { vec4 p = IVP * vec4(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z, 1.0); return p.xyz / p.w; }
+float D(ivec2 p) { return texelFetch(dep, clamp(p, ivec2(0), ivec2(size) - 1), 0).r; }
+vec3 P(ivec2 p) { return wpos((vec2(p) + 0.5) / size, D(p)); }
+vec3 Pf(vec2 px) { return wpos(px / size, textureLod(dep, px / size, 0.0).r); }
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = texelFetch(col, p, 0);
+    o = c;
+    float z = D(p);
+    if (z >= 0.99999) return;
+    vec3 X = P(p);
+    float zl = D(p - ivec2(1, 0)), zr = D(p + ivec2(1, 0)), zd = D(p - ivec2(0, 1)), zu = D(p + ivec2(0, 1));
+    vec3 dx = abs(zr - z) < abs(z - zl) ? P(p + ivec2(1, 0)) - X : X - P(p - ivec2(1, 0));
+    vec3 dy = abs(zu - z) < abs(z - zd) ? P(p + ivec2(0, 1)) - X : X - P(p - ivec2(0, 1));
+    vec3 N = normalize(cross(dx, dy));
+    vec3 V = cam - X;
+    float dist = length(V);
+    V /= dist;
+    if (dot(N, V) < 0.0) N = -N;
+    float rpx = min(radius * projScale / dist, 48.0);   // radius on screen, pixels
+    if (rpx < 1.5) return;
+    // interleaved 4x4 noise, rotated every frame
+    int ix = p.x & 3, iy = p.y & 3;
+    float n1 = fract(float(ix * 4 + iy) * 0.0625 * 7.0 + seed);
+    float n2 = fract(float(iy * 4 + ix) * 0.0625 * 5.0 + seed * 1.7);
+    const int SLICES = 2, STEPS = 4;
+    float vis = 0.0;
+    for (int s = 0; s < SLICES; s++) {
+        float phi = (float(s) + n1) * PI / float(SLICES);
+        vec2 dir = vec2(cos(phi), sin(phi));
+        // world-space slice tangent, orthogonal to the view direction
+        vec3 T = Pf(gl_FragCoord.xy + dir * 2.0) - X;
+        T = normalize(T - V * dot(T, V));
+        vec3 ax = normalize(cross(T, V));
+        vec3 Np = N - ax * dot(N, ax);
+        float lp = length(Np);
+        float ng = sign(dot(Np, T)) * acos(clamp(dot(Np / max(lp, 1e-4), V), -1.0, 1.0));
+        float c1 = -1.0, c2 = -1.0;
+        for (int i = 0; i < STEPS; i++) {
+            float t = (float(i) + n2) / float(STEPS);
+            vec2 off = dir * max(t * t * rpx, 1.0 + float(i));
+            vec3 d2 = Pf(gl_FragCoord.xy + off) - X, d1 = Pf(gl_FragCoord.xy - off) - X;
+            float l2 = length(d2), l1 = length(d1);
+            float f2 = clamp(1.0 - l2 * l2 / (radius * radius), 0.0, 1.0), f1 = clamp(1.0 - l1 * l1 / (radius * radius), 0.0, 1.0);
+            c2 = max(c2, mix(-1.0, dot(d2, V) / max(l2, 1e-4), f2));
+            c1 = max(c1, mix(-1.0, dot(d1, V) / max(l1, 1e-4), f1));
+        }
+        float h1 = -acos(clamp(c1, -1.0, 1.0)), h2 = acos(clamp(c2, -1.0, 1.0));
+        h1 = ng + max(h1 - ng, -PI * 0.5);
+        h2 = ng + min(h2 - ng, PI * 0.5);
+        float sn = sin(ng), cn = cos(ng);
+        vis += lp * 0.25 * ((-cos(2.0 * h1 - ng) + cn + 2.0 * h1 * sn) + (-cos(2.0 * h2 - ng) + cn + 2.0 * h2 * sn));
+    }
+    float ao = clamp(vis / float(SLICES), 0.0, 1.0);
+    if (dbg == 4) { o.rgb = vec3(ao); return; }
+    // grass is alpha-tested cards: full occlusion between them turns it black and noisy
+    float mx = max(c.r, max(c.g, c.b));
+    float grass = smoothstep(0.04, 0.15, (c.g - max(c.r, c.b)) / (mx + 1e-4));
+    o.rgb = c.rgb * mix(1.0, ao, strength * (1.0 - 0.6 * grass));
+}
+)";
+static GLuint g_ao_prog, g_ao_fbo;
+static GLint g_ao_u[10];
+static Target g_ao;
+
+GLuint post_ao(GLuint col, GLuint dep, int w, int h, const float *vp, const float *ivp, const float *cam, float strength, uint64_t frame) {
+    if (!init()) return col;
+    if (!g_ao_prog) {
+        GLuint vs = compile(GL_VERTEX_SHADER, kVS), fs = compile(GL_FRAGMENT_SHADER, kAoFS);
+        if (!vs || !fs) return col;
+        g_ao_prog = glCreateProgram();
+        glAttachShader(g_ao_prog, vs); glAttachShader(g_ao_prog, fs); glLinkProgram(g_ao_prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        const char *n[] = {"col", "dep", "IVP", "cam", "size", "strength", "radius", "projScale", "seed", "dbg"};
+        for (int i = 0; i < 10; i++) g_ao_u[i] = glGetUniformLocation(g_ao_prog, n[i]);
+        glGenFramebuffers(1, &g_ao_fbo);
+        rtlog("post: ambient occlusion (GTAO) ready");
+    }
+    if (!g_ao.tex || g_ao.w != w || g_ao.h != h) {
+        if (!g_ao.tex) glGenTextures(1, &g_ao.tex);
+        glBindTexture(GL_TEXTURE_2D, g_ao.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_ao_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_ao.tex, 0);
+        g_ao.w = w; g_ao.h = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_ao_fbo);
+    GLenum b0 = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1, &b0);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_FRAMEBUFFER_SRGB);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMaski(0, 1, 1, 1, 1);
+    glViewport(0, 0, w, h);
+    glUseProgram(g_ao_prog);
+    glActiveTexture(GL_TEXTURE0); glBindSampler(0, 0); glBindTexture(GL_TEXTURE_2D, col); glUniform1i(g_ao_u[0], 0);
+    glActiveTexture(GL_TEXTURE1); glBindSampler(1, 0); glBindTexture(GL_TEXTURE_2D, dep); glUniform1i(g_ao_u[1], 1);
+    glUniformMatrix4fv(g_ao_u[2], 1, GL_TRUE, ivp);
+    glUniform3fv(g_ao_u[3], 1, cam);
+    glUniform2f(g_ao_u[4], (float)w, (float)h);
+    glUniform1f(g_ao_u[5], strength);
+    static float radius = getenv("FVR_AO_RADIUS") ? (float)atof(getenv("FVR_AO_RADIUS")) : 25.0f;   // world units
+    glUniform1f(g_ao_u[6], radius);
+    // pixels per world unit at distance 1: half the height times the projection's y scale
+    float py = sqrtf(vp[4] * vp[4] + vp[5] * vp[5] + vp[6] * vp[6]);
+    glUniform1f(g_ao_u[7], 0.5f * h * py);
+    glUniform1f(g_ao_u[8], (float)(frame % 16) * 0.618f);
+    static int dbg = getenv("FVR_SSR_DEBUG") ? atoi(getenv("FVR_SSR_DEBUG")) : 0;
+    glUniform1i(g_ao_u[9], dbg);
+    glBindVertexArray(g_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    return g_ao.tex;
+}

@@ -926,7 +926,7 @@ static void taa_bind() {
     D->taa_rt = D->rt[0];
     D->cur_fbo = D->taa_fbo;
 }
-// FVR_FPS: GPU time of the scene pass, the reflections and the temporal pass (timestamp queries).
+// FVR_FPS: GPU time of the scene pass, AO + reflections and the temporal pass (timestamp queries).
 static void taa_timer(int point) {   // point 0: scene starts, 1: reflections, 2: temporal pass, 3: done
     static int on = getenv("FVR_FPS") ? 1 : 0;
     if (!on) return;
@@ -937,7 +937,7 @@ static void taa_timer(int point) {   // point 0: scene starts, 1: reflections, 2
     if (point == 0 && pending[set]) {   // results of two frames ago
         for (int i = 0; i < 3; i++) { GLuint64 t = 0; glGetQueryObjectui64v(q[set][i], GL_QUERY_RESULT, &t); sum[i] += t / 1e6; }
         pending[set] = false;
-        if (++n == 120) { rtlog("gpu: scene %.2f ms, reflections %.2f ms, temporal %.2f ms", sum[0] / n, sum[1] / n, sum[2] / n); sum[0] = sum[1] = sum[2] = 0; n = 0; }
+        if (++n == 120) { rtlog("gpu: scene %.2f ms, AO + reflections %.2f ms, temporal %.2f ms", sum[0] / n, sum[1] / n, sum[2] / n); sum[0] = sum[1] = sum[2] = 0; n = 0; }
     }
     if (active) glEndQuery(GL_TIME_ELAPSED);
     active = point < 3;
@@ -1015,6 +1015,7 @@ static void vel_frame_end() {
     D->vp_prev_ok = drawn && D->vp_cur_ok;
     D->vp_cur_ok = D->vel_R_ok = false;
 }
+GLuint post_ao(GLuint col, GLuint dep, int w, int h, const float *vp, const float *ivp, const float *cam, float strength, uint64_t frame);
 GLuint post_ssr(GLuint col, GLuint dep, int w, int h, const float *vp, const float *ivp, const float *cam, float strength, uint64_t frame);
 // Player options outside the game's menus: environment FVR_<NAME>, else "name=value" lines in
 // options.txt in the user folder.
@@ -1041,14 +1042,15 @@ static void taa_resolve(Surface *dst) {
     bool reset = !D->taa_have || D->taa_last + 1 != D->frame;
     GLuint col = D->taa_col;
     taa_timer(1);
-    static float ssr = fvr_option("ssr", 0);
+    static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
     float ivp[16];
-    if (ssr > 0 && D->vp_cur_ok && mat4_inv(D->vp_cur, ivp)) {
+    if ((ssr > 0 || ao > 0) && D->vp_cur_ok && mat4_inv(D->vp_cur, ivp)) {
         // camera position: the point the projection maps to w = 0 at the image centre
         float cam[3] = {ivp[2], ivp[6], ivp[10]};
         float cw = ivp[14];
         if (fabsf(cw) > 1e-12f) { cam[0] /= cw; cam[1] /= cw; cam[2] /= cw; }
-        col = post_ssr(D->taa_col, D->taa_dep, D->taa_lw, D->taa_lh, D->vp_cur, ivp, cam, ssr, D->frame);
+        if (ao > 0) col = post_ao(col, D->taa_dep, D->taa_lw, D->taa_lh, D->vp_cur, ivp, cam, ao, D->frame);
+        if (ssr > 0) col = post_ssr(col, D->taa_dep, D->taa_lw, D->taa_lh, D->vp_cur, ivp, cam, ssr, D->frame);
     }
     taa_timer(2);
     post_taa(col, D->taa_dep, D->taa_vel, D->taa_lw, D->taa_lh, dst->gl_tex(), dst->w, dst->h, D->taa_jit[0], D->taa_jit[1], reset);

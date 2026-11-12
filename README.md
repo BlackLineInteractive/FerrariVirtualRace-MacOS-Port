@@ -55,15 +55,18 @@ The `Temporal` entries work like AMD FSR 2 (it is the port's own implementation,
 
 The game itself is usually limited by its ~12,000 draw calls per frame rather than by pixels, so upscaling frees the GPU but does not always raise the frame rate.
 
-### Screen-space reflections
+### Ambient occlusion and screen-space reflections
 
-Optional, with the `Temporal` modes: the track surface reflects the cars, buildings and sky at grazing angles. The game has no material data, so it is applied to near-horizontal surfaces that are not grass. Enable it in `~/Library/Application Support/FerrariVirtualRace/options.txt`:
+Both are optional and work with the `Temporal` modes, which also smooth out their per-frame noise. They are switched on in `~/Library/Application Support/FerrariVirtualRace/options.txt` (the value is the strength, 0 = off):
 
 ```text
+ao=0.8
 ssr=0.8
 ```
 
-The value is the strength (0 = off). Reflections cost about 4 ms with `Temporal 2x` at 4K and much more at native 4K, so use them with `Temporal 1.5x` or `Temporal 2x`.
+**Ambient occlusion** (GTAO) darkens creases and contact areas the game's lighting leaves flat: the base of walls, the grandstands, under the cars, and gives the grass volume. About 5 ms with `Temporal 2x` at 4K.
+
+**Reflections**: the track surface reflects the cars, buildings and sky at grazing angles. The game has no material data, so it is applied to near-horizontal surfaces that are not grass. Reflections cost about 4 ms with `Temporal 2x` at 4K and much more at native 4K, so use them with `Temporal 1.5x` or `Temporal 2x`.
 
 ## How It Works
 
@@ -115,7 +118,7 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 | --- | --- |
 | `FVR_GAME_DIR` | Game folder (skips auto-detection) |
 | `FVR_AA` | Force anti-aliasing: `off`, `fxaa`, `msaa2`, `msaa4`, `msaa8`, `fsr`, `taa`, `taa15`, `taa2` |
-| `FVR_SSR` | Screen-space reflection strength (overrides `options.txt`); `FVR_SSR_DEBUG=1/2/3` shows normals / mask / ray hits |
+| `FVR_SSR`, `FVR_AO` | Reflection / ambient-occlusion strength (override `options.txt`); `FVR_SSR_DEBUG=1/2/3/4` shows normals / reflection mask / ray hits / occlusion; `FVR_AO_RADIUS` (world units, default 25) |
 | `FVR_TAA_SCALE` | Override the render scale of the temporal modes (e.g. `0.75`) |
 | `FVR_FPS=1` | Print FPS every two seconds, explain slow frames, and log the GPU time of the scene, reflection and temporal passes |
 | `FVR_VSYNC=0` | Turn vertical sync off (benchmarks) |
@@ -138,7 +141,7 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md): fewer draw calls (the real frame-rate limit), a Metal backend, more Ferrari models, higher track detail and new tracks.
+See [docs/ROADMAP.md](docs/ROADMAP.md): fewer draw calls (the real frame-rate limit), a Metal backend, ray-traced reflections and glass, and the "FVR 2.0" plans: more Ferraris, new tracks, weather, multiplayer and a new lighting / PBR renderer.
 
 ## Support & Links
 
