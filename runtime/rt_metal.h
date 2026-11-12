@@ -7,7 +7,7 @@
 // One TLAS leaf: world -> object (3 rows of a 3x4 matrix), where its CWBVH and triangle
 // attributes live (node / triangle buffers in float4 units, attributes in records) and its
 // material. 128 bytes, as the kernel reads it. flags: 1 merged track (its own buffers, per-triangle
-// textures), 2 car material (hemisphere ambient), 4 texture matrix in uvm.
+// textures), 2 car material (hemisphere ambient), 4 texture matrix in uvm, 8 glass.
 struct RtmInst {
     float w2o[12];
     uint32_t node_base, tri_base, attr_base, flags;
@@ -45,5 +45,9 @@ bool rtm_mask_textures(int w, int h, unsigned *gl_m0, unsigned *gl_m1);
 // Returns the GL rectangle texture of hits: (position, 1) hit, (0, 0, 0, 2) miss, 0 not traced;
 // the shaded colour of each hit is in rtm_hit_colour().
 unsigned rtm_trace_reflect(const RtmInst *inst, size_t n_inst, const void *tlas_nodes, size_t n_tlas, const uint32_t *prim, size_t n_prim,
-                           const float *cam, const RtmLight &light, uint32_t *rays, double *gpu_ms);
+                           const float *cam, const RtmLight &light, bool refract, uint32_t *rays, double *gpu_ms);
+// refract: also trace through glass (rt_refract=1). rays[4]: reflection rays, glass pixels, glass pixels whose refracted ray met a second glass
+// surface, and the sum of those distances x 1000.
 unsigned rtm_hit_colour();
+// Glass: transmittance x (refracted - straight-through colour), to add to the frame.
+unsigned rtm_glass();

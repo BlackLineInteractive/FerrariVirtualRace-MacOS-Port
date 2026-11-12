@@ -76,6 +76,8 @@ ssr=0.8
 
 `rt=1` (needs a `Temporal` mode; turns on `pbr` too) traces reflection rays with Metal, only for the pixels where the material is mirror-like: clear-coated paint, glass and chrome (GGX alpha up to 0.15). The PBR car shader marks those pixels in two extra render targets shared with Metal through IOSurfaces; Metal traces one ray for each (about 20,000-40,000 rays per frame at 960x540, under 2 ms on a Radeon Pro 5500M), and each hit is coloured from the frame itself when the hit point is visible on screen; otherwise Metal shades it as the game would: the diffuse texture at the hit (every texture is kept as a copy of at most 128x128 when the game loads it), the sun with a shadow ray, the track's baked light or the cars' hemisphere light. Rays that miss take the sky from the game's reflection cube. `FVR_RT_DEBUG=1` shows the sources (green screen, red shaded by Metal, blue sky), `2` only the reflected colour.
 
+`rt_refract=1` also traces rays through glass (IOR 1.5, refracting at every glass surface it meets, with total internal reflection) and adds the difference between the refracted and the straight view. Only glass with a thickness bends the view; a single sheet is treated as thin (no change). Every glass part of the shipped cars, the lamp covers included, is a single sheet, so this changes nothing for them and is off by default; it is there for models with real glass thickness.
+
 ### The game's own reflections and baked light
 
 Two more `options.txt` settings take out what the game bakes in, so that ambient occlusion now, and ray tracing later, do that work instead:
@@ -146,6 +148,7 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 | `FVR_REFLECTIONS`, `FVR_BAKED_LIGHT` | Override `reflections` / `baked_light` from `options.txt` |
 | `FVR_RT=1` | Ray-tracing scene (with a `Temporal` mode): a [tinybvh](third_party/tiny_bvh.h) CWBVH per mesh, the track remembered after it leaves the view and merged into one world-space CWBVH in the background, and a TLAS over each frame's cars and other draws; `FVR_RT_STATS=1` logs counts and timings once a second; `FVR_RT_BUDGET` (ms per frame for new meshes, default 6); `FVR_RT_WORLD` (frames a track piece must be drawn before it is remembered, default 10) |
 | `FVR_RT_VIEW=1` / `2` | Ray-tracing check on the GPU: Metal traces one ray per pixel through the scene and shows it instead of the game's image (OpenGL reads it through an IOSurface); `2` looks backwards from the camera, at what the game is not drawing |
+| `FVR_RT_REFRACT=1` | Rays through glass as well (`FVR_RT_DEBUG=3` shows the refraction correction, x4) |
 | `FVR_RT=1`, `FVR_RT_DEBUG=1` | Ray-traced reflections (see above); the debug view colours the reflection sources |
 | `FVR_MAT_LOG=<seconds>` | Logs one scene frame's draws grouped by shaders, blend state, textures and car material constants |
 | `FVR_RT_DUMP=<seconds>` | Ray-tracing check: traces the first frame after that time on the CPU through the TLAS and every instance's CWBVH from the game's camera (one colour per instance) and saves `rt_dump.ppm` in `FVR_SHOT_DIR` |

@@ -84,6 +84,7 @@ struct Inst {
     const char *shader;
     bool fixed;                  // world-space track geometry (kept in the world memory)
     int tex, kind;               // material (RtDraw)
+    bool glass;
     float color[4], uvm[8];
     bool has_uvm;
     bool kept;                   // from the world memory, w / iw already set
@@ -290,7 +291,7 @@ void rt_capture(const RtDraw &d) {
     b->used = g_frame;
     Inst in;
     in.b = b; memcpy(in.m, d.m, 64); in.wvp = d.wvp; in.shader = d.shader; in.fixed = d.fixed; in.kept = false;
-    in.tex = d.tex; in.kind = d.kind; memcpy(in.color, d.color, 16); memcpy(in.uvm, d.uvm, 32); in.has_uvm = d.has_uvm;
+    in.tex = d.tex; in.kind = d.kind; in.glass = d.glass; memcpy(in.color, d.color, 16); memcpy(in.uvm, d.uvm, 32); in.has_uvm = d.has_uvm;
     g_inst.push_back(in);
     g_draws++;
 }
@@ -396,7 +397,7 @@ static bool build_tlas(const float *vp) {
         if (w.frames >= (uint32_t)world_frames()) { established++; if (!merged) g_merge_pending++; it->first.b->used = frame; }
         if (w.seen != frame && w.frames >= (uint32_t)world_frames() && !merged) {
             Inst in; in.b = b; in.wvp = false; in.shader = "world memory"; in.fixed = true; in.kept = true;
-            in.tex = w.tex; in.kind = 0; in.color[0] = in.color[1] = in.color[2] = in.color[3] = 1; memcpy(in.uvm, w.uvm, 32); in.has_uvm = w.has_uvm;
+            in.tex = w.tex; in.kind = 0; in.glass = false; in.color[0] = in.color[1] = in.color[2] = in.color[3] = 1; memcpy(in.uvm, w.uvm, 32); in.has_uvm = w.has_uvm;
             memcpy(in.w, w.w, 48); memcpy(in.iw, w.iw, 48);
             b->used = frame;
             g_inst.push_back(in);
@@ -406,7 +407,7 @@ static bool build_tlas(const float *vp) {
     }
     if (g_merged) {
         Inst in; in.b = g_merged->blas.get(); in.wvp = false; in.shader = "merged track"; in.fixed = false; in.kept = true;
-        in.tex = -1; in.kind = 0; in.color[0] = in.color[1] = in.color[2] = in.color[3] = 1; in.has_uvm = false;
+        in.tex = -1; in.kind = 0; in.glass = false; in.color[0] = in.color[1] = in.color[2] = in.color[3] = 1; in.has_uvm = false;
         static const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         memcpy(in.w, I, 48); memcpy(in.iw, I, 48);
         g_inst.push_back(in);
@@ -748,7 +749,7 @@ static bool gpu_frame(uint64_t frame, const float *vp) {
         g_gi[i].tri_base = merged ? 0 : g_inst[i].b->tri_base;
         g_gi[i].attr_base = merged ? 0 : g_inst[i].b->attr_base;
         const Inst &in = g_inst[i];
-        g_gi[i].flags = (merged ? 1u : 0u) | (in.kind == 1 ? 2u : 0u) | (in.has_uvm ? 4u : 0u);
+        g_gi[i].flags = (merged ? 1u : 0u) | (in.kind == 1 ? 2u : 0u) | (in.has_uvm ? 4u : 0u) | (in.glass ? 8u : 0u);
         memcpy(g_gi[i].color, in.color, 16);
         memcpy(g_gi[i].uvm, in.uvm, 32);
         g_gi[i].tex = in.tex; g_gi[i].pad[0] = g_gi[i].pad[1] = g_gi[i].pad[2] = 0;
@@ -772,18 +773,18 @@ unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w,
     return tex;
 }
 
-unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam) {
+unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam, bool refract) {
     auto t0 = Clock::now();
     if (!gpu_frame(frame, vp)) return 0;
     double gpu = 0;
-    uint32_t rays = 0;
-    unsigned tex = rtm_trace_reflect(g_gi.data(), g_gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), cam, g_light, &rays, &gpu);
+    uint32_t rays[4] = {};
+    unsigned tex = rtm_trace_reflect(g_gi.data(), g_gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), cam, g_light, refract, rays, &gpu);
     double all = ms_since(t0);
     static uint64_t last;
     if (stats_on() && SDL_GetTicks() - last >= 1000) {
         last = SDL_GetTicks();
-        rtlog("rt: reflections: %u rays, Metal %.2f ms (wall %.2f ms incl. TLAS %.2f ms and upload), %zu instances, merged track %u triangles, %zu textures (%.1f MB)",
-              rays, gpu, all, g_tlas_ms, g_inst.size(), g_merged ? g_merged->blas->tris : 0, g_texinfo.size(), g_texels.size() * 4 / 1048576.0);
+        rtlog("rt: reflections: %u rays (glass %u, of which %u through a second surface, mean thickness %.3f), Metal %.2f ms (wall %.2f ms incl. TLAS %.2f ms and upload), %zu instances, merged track %u triangles, %zu textures (%.1f MB)",
+              rays[0], rays[1], rays[2], rays[2] ? rays[3] / 1000.0 / rays[2] : 0.0, gpu, all, g_tlas_ms, g_inst.size(), g_merged ? g_merged->blas->tris : 0, g_texinfo.size(), g_texels.size() * 4 / 1048576.0);
     }
     return tex;
 }

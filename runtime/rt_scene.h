@@ -36,6 +36,7 @@ struct RtDraw {
     float uvm[8];                // texture matrix rows (u = dot(row0.xyz, (u, v, 1)), v = row1)
     bool has_uvm;
     int kind;                    // 0 track (baked light), 1 car material (hemisphere ambient)
+    bool glass;                  // see-through car material (DiffColor.w < 1): refraction rays pass through
 };
 
 // A diffuse texture as the game keeps it in memory: one mip level, D3DFMT (A8R8G8B8, X8R8G8B8,
@@ -68,4 +69,5 @@ void rt_frame_end(uint64_t frame, const float *vp, const float *ivp);
 unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w, int h, int mode);
 // Reflection rays for the pixels the PBR car shader marked (rtm_mask_textures), from the camera at
 // `cam`. Returns the OpenGL rectangle texture of hit points (see rtm_trace_reflect), or 0.
-unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam);
+// refract: also trace through glass and return the refraction correction (rtm_glass).
+unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam, bool refract);

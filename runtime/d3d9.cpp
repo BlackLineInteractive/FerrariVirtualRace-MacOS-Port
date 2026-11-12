@@ -1080,9 +1080,11 @@ static float fvr_option(const char *name, float def) {
 }
 // Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 keeps the scene's acceleration structures;
 // rt_view=1 also traces it on the GPU and shows that instead of the game's image (a check).
-GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint cube, const float *vp, const float *ivp, const float *cam);
+GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint tcol, GLuint cube, const float *vp, const float *ivp, const float *cam);
 // rt=1: ray-traced reflections on the mirror-like car surfaces (PBR material, implies pbr=1)
 static bool rt_reflections() { static bool on = fvr_option("rt", 0) > 0; return on; }
+// rt_refract=1: also trace through glass (only glass with a thickness bends the view)
+static bool rt_refract() { static bool on = fvr_option("rt_refract", 0) > 0; return on; }
 static int rt_view_mode() { static int v = (int)fvr_option("rt_view", 0); return v; }
 static bool rt_enabled() { static bool on = fvr_option("rt", 0) > 0 || rt_view_mode() > 0; return on; }
 // Copies the ray-traced image (rectangle texture, w x h) over the scene colour (lw x lh).
@@ -1109,8 +1111,8 @@ static void taa_resolve(Surface *dst) {
     if (D->taa_m0 && D->rt_cam_ok && D->vp_cur_ok) {   // reflection rays where the car material asked for them
         float ivp2[16];
         if (mat4_inv(D->vp_cur, ivp2))
-            if (GLuint hit = rt_trace_reflect(D->frame, D->vp_cur, D->rt_cam))
-                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, rtm_hit_colour(), D->rt_cube, D->vp_cur, ivp2, D->rt_cam);
+            if (GLuint hit = rt_trace_reflect(D->frame, D->vp_cur, D->rt_cam, rt_refract()))
+                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, rtm_hit_colour(), rtm_glass(), D->rt_cube, D->vp_cur, ivp2, D->rt_cam);
     }
     static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
     float ivp[16];
@@ -1844,6 +1846,7 @@ static void rt_material(RtDraw &d, Decl *decl) {
     if (ps && ps->ctab.count("DiffColor")) {
         d.kind = 1;
         memcpy(d.color, pc[0], 16);
+        d.glass = pc[0][3] < 0.99f;
         rt_lighting(pc[16], pc[17], pc[10], pc[11], 0);
     }
     if (vs && vs->ctab.count("AmbLevel")) rt_lighting(nullptr, nullptr, nullptr, nullptr, D->st.vsf[37][3]);

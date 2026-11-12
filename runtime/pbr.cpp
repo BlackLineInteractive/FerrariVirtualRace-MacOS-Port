@@ -128,6 +128,10 @@ std::string body(const char *N, const char *V, const char *S, const char *FOG, c
     vec3 p_col = p_lit * p_a0 * (1.0 - p_metal) * (1.0 - p_coat) + p_spec + p_envs;
     float p_alpha = p_a0 + (1.0 - p_a0) * p_coat;
 )GLSL";
+    if (g_rt && !textured) b += R"GLSL(
+    // glass: rays also go through it (refraction); m0.w < 0 carries how much light it lets through
+    if (p_a0 < 0.99) { oRtM0.w = -max(1.0 - p_alpha, 1e-3); oRtM1.w = max(oRtM1.w, 1e-4); }
+)GLSL";
     b += R"GLSL(
     oC0.rgb = mix(pc[29].rgb, p_col, @FOG.x);
     oC0.a = p_alpha;

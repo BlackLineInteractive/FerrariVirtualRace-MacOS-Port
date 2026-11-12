@@ -848,7 +848,7 @@ GLuint post_ao(GLuint col, GLuint dep, int w, int h, const float *vp, const floa
 // misses: the sky). Added to the scene colour with the material's weight.
 static const char *kRtFS = R"(#version 410 core
 uniform sampler2D col, dep;
-uniform sampler2DRect m0, m1, hit, hcol;
+uniform sampler2DRect m0, m1, hit, hcol, tcol;
 uniform samplerCube env;
 uniform int haveEnv, dbg;
 uniform mat4 VP, IVP;
@@ -881,14 +881,16 @@ void main() {
     }
     if (dbg == 1) { o.rgb = kind == 1 ? vec3(0.0, 1.0, 0.0) : (kind == 2 ? vec3(1.0, 0.2, 0.0) : vec3(0.0, 0.3, 1.0)); return; }
     if (dbg == 2) { o.rgb = L; return; }
-    o.rgb = c.rgb + b.w * L;
+    vec3 refr = texelFetch(tcol, p).rgb;
+    if (dbg == 3) { o.rgb = c.rgb * 0.3 + abs(refr) * 4.0; return; }
+    o.rgb = max(c.rgb + b.w * L + refr, vec3(0.0));
 }
 )";
 static GLuint g_rt_prog, g_rt_fbo;
-static GLint g_rt_u[12];
+static GLint g_rt_u[13];
 static Target g_rt;
 
-GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint cube, const float *vp, const float *ivp, const float *cam) {
+GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint tcolt, GLuint cube, const float *vp, const float *ivp, const float *cam) {
     if (!init()) return col;
     if (!g_rt_prog) {
         GLuint vs = compile(GL_VERTEX_SHADER, kVS), fs = compile(GL_FRAGMENT_SHADER, kRtFS);
@@ -896,8 +898,8 @@ GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuin
         g_rt_prog = glCreateProgram();
         glAttachShader(g_rt_prog, vs); glAttachShader(g_rt_prog, fs); glLinkProgram(g_rt_prog);
         glDeleteShader(vs); glDeleteShader(fs);
-        const char *n[] = {"col", "dep", "m0", "m1", "hit", "env", "haveEnv", "dbg", "VP", "IVP", "cam", "hcol"};
-        for (int i = 0; i < 12; i++) g_rt_u[i] = glGetUniformLocation(g_rt_prog, n[i]);
+        const char *n[] = {"col", "dep", "m0", "m1", "hit", "env", "haveEnv", "dbg", "VP", "IVP", "cam", "hcol", "tcol"};
+        for (int i = 0; i < 13; i++) g_rt_u[i] = glGetUniformLocation(g_rt_prog, n[i]);
         glGenFramebuffers(1, &g_rt_fbo);
         rtlog("post: ray-traced reflections ready");
     }
@@ -929,6 +931,7 @@ GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuin
     glActiveTexture(GL_TEXTURE4); glBindSampler(4, 0); glBindTexture(GL_TEXTURE_RECTANGLE, hit); glUniform1i(g_rt_u[4], 4);
     glActiveTexture(GL_TEXTURE5); glBindSampler(5, g_sampler); glBindTexture(GL_TEXTURE_CUBE_MAP, cube); glUniform1i(g_rt_u[5], 5);
     glActiveTexture(GL_TEXTURE6); glBindSampler(6, 0); glBindTexture(GL_TEXTURE_RECTANGLE, hcol); glUniform1i(g_rt_u[11], 6);
+    glActiveTexture(GL_TEXTURE7); glBindSampler(7, 0); glBindTexture(GL_TEXTURE_RECTANGLE, tcolt); glUniform1i(g_rt_u[12], 7);
     glUniform1i(g_rt_u[6], cube ? 1 : 0);
     static int dbg = getenv("FVR_RT_DEBUG") ? atoi(getenv("FVR_RT_DEBUG")) : 0;
     glUniform1i(g_rt_u[7], dbg);
@@ -936,7 +939,7 @@ GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuin
     glUniformMatrix4fv(g_rt_u[9], 1, GL_TRUE, ivp);
     glUniform3fv(g_rt_u[10], 1, cam);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    for (int i = 6; i >= 0; i--) { glActiveTexture(GL_TEXTURE0 + i); glBindSampler(i, 0); }
+    for (int i = 7; i >= 0; i--) { glActiveTexture(GL_TEXTURE0 + i); glBindSampler(i, 0); }
     glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     return g_rt.tex;
 }
