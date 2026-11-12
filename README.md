@@ -2,11 +2,19 @@
 
 A native macOS (`x86_64`) port of *Ferrari Virtual Race* (2009) created by statically recompiling the original 32-bit Windows executable (`FerrariVR_Hi.exe`) into C and pairing it with a custom Win32 / DirectX host runtime built on SDL3 and OpenGL 4.1 Core.
 
-![In-game screenshot on Mugello](media/gameplay.jpg)
+![Ray-traced car-to-car reflections at Mugello](media/rt_car_to_car_reflections.png)
 
 > **Note:** This repository contains no original game binaries, copyrighted code, or game assets. You must supply your own copy of *Ferrari Virtual Race* to generate the recompiled C sources and run the game.
 
 ## Screenshots
+
+| Ray-traced chase camera | Sun glare and pit wall reflections |
+| --- | --- |
+| ![Ray-traced chase camera](media/rt_race_chase.png) | ![Sun glare and pit wall reflections](media/rt_rear_pits.png) |
+
+| Mugello circuit gantry | Standard gameplay |
+| --- | --- |
+| ![Mugello circuit gantry](media/rt_rear_gantry.png) | ![In-game screenshot on Mugello](media/gameplay.jpg) |
 
 | Main Menu | Car Selection |
 | --- | --- |
