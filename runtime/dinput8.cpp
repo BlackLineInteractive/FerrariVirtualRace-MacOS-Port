@@ -110,7 +110,7 @@ static void produce_state(Dev *d, std::vector<uint8_t> &st) {
         int n = 0;
         const bool *ks = SDL_GetKeyboardState(&n);
         uint8_t keys[256] = {};
-        for (int s = 0; s < n; s++) if (ks[s]) { uint32_t k = ui_dik_of((SDL_Scancode)s); if (k && k < 256) keys[k] = 0x80; }
+        for (int s = 0; s < n; s++) if (ks[s] || ui_key_injected((SDL_Scancode)s)) { uint32_t k = ui_dik_of((SDL_Scancode)s); if (k && k < 256) keys[k] = 0x80; }
         for (auto &m : d->map) if (m.ofs < st.size()) st[m.ofs] = keys[d->objs[m.obj].index];
         return;
     }

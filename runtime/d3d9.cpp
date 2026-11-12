@@ -4,9 +4,11 @@
 // GL texture is the top row in D3D terms. Uploaded textures therefore need no flipping, viewport and
 // scissor Y coordinates are used as-is, and Present flips the back buffer once when blitting to the window.
 #include "d3d9_internal.h"
+#include <OpenGL/OpenGL.h>
 #include "win32ui.h"
 #include <mutex>
 #include <unordered_map>
+#include <set>
 #include <pthread.h>
 #include <cmath>
 #include <cstring>
@@ -73,18 +75,20 @@ GLenum Surface::gl_target() const {
 }
 
 static void free_fbos_for(GLuint tex);
+static void tex_cache_forget(GLuint tex);
+static void attr_cache_forget(GLuint buf);
 Surface::~Surface() {
     if (container) return;
-    if (tex) { free_fbos_for(tex); glDeleteTextures(1, &tex); }
+    if (tex) { free_fbos_for(tex); tex_cache_forget(tex); glDeleteTextures(1, &tex); }
     if (mem) gfree(mem);
 }
 Texture::~Texture() {
     for (auto *s : surfs) if (s) { g_objs.erase(s->guest); gfree(s->guest); delete s; }
     for (auto m : mem) if (m) gfree(m);
-    if (tex) { free_fbos_for(tex); glDeleteTextures(1, &tex); }
+    if (tex) { free_fbos_for(tex); tex_cache_forget(tex); glDeleteTextures(1, &tex); }
 }
 Buffer::~Buffer() {
-    if (buf) glDeleteBuffers(1, &buf);
+    if (buf) { attr_cache_forget(buf); glDeleteBuffers(1, &buf); }
     if (mem) gfree(mem);
 }
 
@@ -94,9 +98,17 @@ struct Program {
     bool ff_vs = false, ff_ps = false;
     GLint vc = -1, vi = -1, vb = -1, pc = -1, pi = -1, pb = -1, posFixup = -1, alphaFunc = -1, alphaRef = -1;
     GLint vfaceSign = -1, fogColor = -1, fogParams = -1;
-    uint64_t vs_ver = ~0ull, ps_ver = ~0ull;
+    uint64_t vs_ver = 0, ps_ver = 0;     // constant versions already uploaded (0 = nothing yet)
     Shader *vs = nullptr, *ps = nullptr;
+    float u_fix[2] = {-1, -1}, u_aref = -1, u_fog[4] = {-1, -1, -1, -1}, u_fogc[3] = {-1, -1, -1};
+    int u_afunc = -1; bool u_vface = false;
+    uint16_t shadow_mask = 0;      // PS samplers compiled as sampler2DShadow
+    std::vector<GLint> vcl, pcl;   // location of every vc[i] / pc[i] (-1 if optimised away)
 };
+// What is currently bound in GL, to skip redundant calls (the macOS driver re-validates on each).
+struct AttrBind { GLuint buf; GLint size; GLenum type; GLboolean norm; GLsizei stride; uintptr_t off; GLuint div; };
+struct TexBind { GLenum target; GLuint tex; };
+static const int kScratchUnit = 31;   // texture unit used for uploads / mip generation, never by draws
 
 struct StateBlock;
 static struct Device {
@@ -110,7 +122,22 @@ static struct Device {
     GLuint samplers[20] = {};
     bool samp_dirty[20] = {};
     bool rs_dirty = true, fbo_dirty = true, vp_dirty = true;
+    uint64_t draws = 0, inst_draws = 0, inst1_draws = 0, up_draws = 0, locks = 0;
+    uint64_t links = 0, tex_new = 0, upload_bytes = 0, mipgens = 0;
     uint64_t vs_ver = 1, ps_ver = 1;
+    uint64_t vsf_ver[256] = {}, psf_ver[224] = {};
+    uint64_t vsib_ver = 1, psib_ver = 1;              // version at which int/bool constants last changed
+    struct CRange { uint64_t ver; uint16_t lo, hi; };
+    CRange crlog[2][64] = {}; uint64_t crn[2] = {};    // recent float-constant writes (VS, PS), newest last   // version at which each float register last changed
+    GLuint cur_prog = 0, cur_ebo = 0;
+    int active_unit = -1;
+    TexBind tex_bound[20] = {};
+    bool samp_bound[20] = {};
+    bool samp_cmp[20] = {};     // depth-compare mode currently set on samplers[i]
+    uint16_t last_mask = 0;
+    AttrBind attr[16] = {};
+    Program *last_prog = nullptr; uint32_t last_vs = 0, last_ps = 0;
+    std::unordered_map<uint64_t, Program *> sm_progs;   // (vs, ps) -> program when both are shaders
     std::map<std::string, Program> progs;
     std::map<std::string, GLuint> ff_shaders;
     StateBlock *recording = nullptr;
@@ -123,6 +150,40 @@ static struct Device {
 } *D;
 
 static uint32_t g_vt[16];
+
+// Record that float registers [lo, hi) of the VS (ps=0) or PS (ps=1) changed at version ver.
+static void note_consts(int ps, uint32_t lo, uint32_t hi, uint64_t ver) {
+    uint64_t *rv = ps ? D->psf_ver : D->vsf_ver;
+    for (uint32_t i = lo; i < hi; i++) rv[i] = ver;
+    D->crlog[ps][D->crn[ps]++ % 64] = {ver, (uint16_t)lo, (uint16_t)hi};
+}
+// Register span that may have changed after version `have` (whole file if the log is too short).
+static void changed_span(int ps, uint64_t have, int nregs, int &lo, int &hi) {
+    lo = nregs; hi = 0;
+    uint64_t n = D->crn[ps], k = 0;
+    for (; k < n && k < 64; k++) {
+        const auto &r = D->crlog[ps][(n - 1 - k) % 64];
+        if (r.ver <= have) return;
+        lo = std::min<int>(lo, r.lo); hi = std::max<int>(hi, r.hi);
+    }
+    if (k == 64) { lo = 0; hi = nregs; }
+}
+static void use_program(GLuint p) { if (D->cur_prog != p) { glUseProgram(p); D->cur_prog = p; } }
+static void active_unit(int u) { if (D->active_unit != u) { glActiveTexture(GL_TEXTURE0 + u); D->active_unit = u; } }
+// Bind a texture for uploads / queries without disturbing the units used by draws.
+static void scratch_bind(GLenum target, GLuint tex) { if (D) active_unit(kScratchUnit); glBindTexture(target, tex); }
+static void tex_cache_forget(GLuint tex) { if (D) for (auto &b : D->tex_bound) if (b.tex == tex) b = {}; }
+static void attr_cache_forget(GLuint buf) {
+    if (!D) return;
+    for (auto &a : D->attr) if (a.buf == buf) a = {};
+    if (D->cur_ebo == buf) D->cur_ebo = 0;
+}
+// Forget every cached binding (after code that changes GL state behind the caches' back).
+static void gl_cache_reset() {
+    D->cur_prog = ~0u; D->active_unit = -1;
+    for (auto &b : D->tex_bound) b = {~0u, ~0u};
+    for (auto &b : D->samp_bound) b = false;
+}
 
 // ====================================================================== D3DCAPS9
 static void fill_caps(uint32_t p) {
@@ -202,13 +263,16 @@ static Texture *create_texture(Kind k, uint32_t w, uint32_t h, uint32_t d, uint3
     if (autogen) levels = full;
     Texture *t = new Texture(k);
     t->w = w; t->h = h; t->d = d; t->levels = levels; t->fmt = fmt; t->usage = usage; t->pool = pool; t->autogen = autogen;
+    // INTZ / DF24 / DF16 return the stored depth; the other depth formats behave as hardware shadow maps.
+    t->shadow = fi->depth && fmt != FOURCC('I','N','T','Z') && fmt != FOURCC('D','F','2','4') && fmt != FOURCC('D','F','1','6');
     int faces = k == K_CUBE ? 6 : 1;
     t->mem.assign(faces * levels, 0);
     t->surfs.assign(faces * levels, nullptr);
     if (t->sysmem()) return t;
     t->target = tex_target(k);
+    D->tex_new++;
     glGenTextures(1, &t->tex);
-    glBindTexture(t->target, t->tex);
+    scratch_bind(t->target, t->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     for (int f = 0; f < faces; f++)
         for (uint32_t l = 0; l < levels; l++) {
@@ -244,7 +308,8 @@ static void upload_level(Texture *t, int face, uint32_t l) {
     const FmtInfo *fi = fmt_info(t->fmt);
     uint32_t lw = mip_dim(t->w, l), lh = mip_dim(t->h, l), ld = t->kind == K_VOL ? mip_dim(t->d, l) : 1;
     uint32_t sz = level_size(t, l, nullptr, nullptr);
-    glBindTexture(t->target, t->tex);
+    D->upload_bytes += sz;
+    scratch_bind(t->target, t->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     GLenum tgt = t->kind == K_CUBE ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : t->target;
@@ -262,7 +327,7 @@ static void readback_level(Texture *t, int face, uint32_t l) {
     uint32_t m = t->mem[face * t->levels + l];
     if (!m || !t->tex) return;
     const FmtInfo *fi = fmt_info(t->fmt);
-    glBindTexture(t->target, t->tex);
+    scratch_bind(t->target, t->tex);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     GLenum tgt = t->kind == K_CUBE ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : t->target;
     if (fi->compressed) glGetCompressedTexImage(tgt, l, H(m));
@@ -312,12 +377,12 @@ static void write_surface_desc(uint32_t p, uint32_t fmt, uint32_t type, uint32_t
 }
 
 M(tex_SetLOD) { GUARD; Texture *t = OBJ<Texture>(ARG(0)); uint32_t old = t->lod; t->lod = std::min(ARG(1), t->levels - 1);
-    if (t->tex) { glBindTexture(t->target, t->tex); glTexParameteri(t->target, GL_TEXTURE_BASE_LEVEL, t->lod); } RETN(2, old); }
+    if (t->tex) { scratch_bind(t->target, t->tex); glTexParameteri(t->target, GL_TEXTURE_BASE_LEVEL, t->lod); } RETN(2, old); }
 M(tex_GetLOD) { GUARD; RETN(1, OBJ<Texture>(ARG(0))->lod); }
 M(tex_GetLevelCount) { GUARD; Texture *t = OBJ<Texture>(ARG(0)); RETN(1, t->autogen ? 1 : t->levels); }
 M(tex_SetAutoGenFilterType) { RETN(2, D3D_OK); }
 M(tex_GetAutoGenFilterType) { RETN(1, 2); }
-M(tex_GenerateMipSubLevels) { GUARD; Texture *t = OBJ<Texture>(ARG(0)); if (t->tex) { glBindTexture(t->target, t->tex); glGenerateMipmap(t->target); } RETN(1, 0); }
+M(tex_GenerateMipSubLevels) { GUARD; Texture *t = OBJ<Texture>(ARG(0)); if (t->tex) { scratch_bind(t->target, t->tex); glGenerateMipmap(t->target); } RETN(1, 0); }
 M(tex_GetLevelDesc) {
     GUARD; Texture *t = OBJ<Texture>(ARG(0));
     uint32_t l = ARG(1);
@@ -396,7 +461,7 @@ static Surface *create_surface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t us
         s->mem = gmalloc(fmt_pitch(fi, w) * fmt_rows(fi, h) + 64, true);
     } else {
         glGenTextures(1, &s->tex);
-        glBindTexture(GL_TEXTURE_2D, s->tex);
+        scratch_bind(GL_TEXTURE_2D, s->tex);
         if (fi->compressed) {
             uint32_t sz = fmt_pitch(fi, w) * fmt_rows(fi, h);
             std::vector<uint8_t> z(sz, 0);
@@ -436,7 +501,7 @@ static uint32_t surf_mem(Surface *s, uint32_t *pitch, bool read) {
     if (!s->mem) {
         s->mem = gmalloc(*pitch * fmt_rows(fi, s->h) + 64, true);
         if (read && s->tex && !fi->depth && !fi->compressed) {
-            glBindTexture(GL_TEXTURE_2D, s->tex);
+            scratch_bind(GL_TEXTURE_2D, s->tex);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glGetTexImage(GL_TEXTURE_2D, 0, fi->format, fi->type, H(s->mem));
         }
@@ -462,7 +527,7 @@ M(surf_UnlockRect) {
     if (s->container) unlock_level(s->container, s->face, s->level);
     else if (s->tex && s->mem) {
         const FmtInfo *fi = fmt_info(s->fmt);
-        glBindTexture(GL_TEXTURE_2D, s->tex);
+        scratch_bind(GL_TEXTURE_2D, s->tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         if (fi->compressed) glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, fi->internal, fmt_pitch(fi, s->w) * fmt_rows(fi, s->h), H(s->mem));
         else if (!fi->depth) glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s->w, s->h, fi->format, fi->type, H(s->mem));
@@ -495,6 +560,7 @@ M(buf_Lock) {
     }
     b->lock_flags |= flags;
     b->locks++;
+    D->locks++;
     W32(ARG(3), b->mem + off);
     RETN(5, D3D_OK);
 }
@@ -632,12 +698,12 @@ static void sb_apply(StateBlock *b) {
     for (int i = 0; i < 20 * 14; i++) if (b->samp[i]) { d.samp[i / 14][i % 14] = s.samp[i / 14][i % 14]; D->samp_dirty[i / 14] = true; }
     for (int i = 0; i < 20; i++) if (b->tex[i]) set_texture(i, s.tex[i]);
     for (int i = 0; i < 512; i++) if (b->xf[i]) memcpy(d.transform[i], s.transform[i], 64);
-    for (int i = 0; i < 256; i++) if (b->vsf[i]) { memcpy(d.vsf[i], s.vsf[i], 16); D->vs_ver++; }
-    for (int i = 0; i < 224; i++) if (b->psf[i]) { memcpy(d.psf[i], s.psf[i], 16); D->ps_ver++; }
-    if (b->vsi) { memcpy(d.vsi, s.vsi, sizeof s.vsi); D->vs_ver++; }
-    if (b->psi) { memcpy(d.psi, s.psi, sizeof s.psi); D->ps_ver++; }
-    if (b->vsb) { memcpy(d.vsb, s.vsb, sizeof s.vsb); D->vs_ver++; }
-    if (b->psb) { memcpy(d.psb, s.psb, sizeof s.psb); D->ps_ver++; }
+    for (int i = 0; i < 256; i++) if (b->vsf[i]) { memcpy(d.vsf[i], s.vsf[i], 16); note_consts(0, i, i + 1, ++D->vs_ver); }
+    for (int i = 0; i < 224; i++) if (b->psf[i]) { memcpy(d.psf[i], s.psf[i], 16); note_consts(1, i, i + 1, ++D->ps_ver); }
+    if (b->vsi) { memcpy(d.vsi, s.vsi, sizeof s.vsi); D->vsib_ver = ++D->vs_ver; }
+    if (b->psi) { memcpy(d.psi, s.psi, sizeof s.psi); D->psib_ver = ++D->ps_ver; }
+    if (b->vsb) { memcpy(d.vsb, s.vsb, sizeof s.vsb); D->vsib_ver = ++D->vs_ver; }
+    if (b->psb) { memcpy(d.psb, s.psb, sizeof s.psb); D->psib_ver = ++D->ps_ver; }
     if (b->vp) { d.vp = s.vp; D->vp_dirty = true; }
     if (b->scissor) memcpy(d.scissor, s.scissor, sizeof s.scissor);
     if (b->streams) for (int i = 0; i < 16; i++) { set_stream(i, s.streams[i].vb, s.streams[i].offset, s.streams[i].stride); d.streams[i].freq = s.streams[i].freq; }
@@ -820,11 +886,92 @@ static GLuint compile_shader(GLenum type, const std::string &src) {
     return sh;
 }
 
+static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask = 0);
+
+// ---- persistent list of (VS, PS) pairs the game has drawn with, so they can be linked while
+// the game is loading instead of stalling the first frame that uses them.
+static std::unordered_map<uint64_t, Shader *> g_shader_by_hash;
+static std::map<uint64_t, std::vector<uint64_t>> g_pair_partners;   // hash -> partner hashes (both directions)
+static std::set<std::pair<uint64_t, uint64_t>> g_pairs;
+static bool g_pairs_loaded;
+static std::string pairs_path() { return g_user_dir + "/shader_pairs.txt"; }
+static void pairs_add(uint64_t v, uint64_t p) {
+    if (!g_pairs.insert({v, p}).second) return;
+    g_pair_partners[v].push_back(p);
+    g_pair_partners[p].push_back(v);
+}
+static void pairs_load() {
+    if (g_pairs_loaded) return;
+    g_pairs_loaded = true;
+    if (FILE *f = fopen(pairs_path().c_str(), "r")) {
+        unsigned long long v, p;
+        while (fscanf(f, "%llx %llx", &v, &p) == 2) pairs_add(v, p);
+        fclose(f);
+        rtlog("d3d9: %zu known shader pairs", g_pairs.size());
+    }
+}
+static uint64_t prog_key(Shader *vs, Shader *ps, uint16_t mask) { return ((uint64_t)vs->uid << 40) | ((uint64_t)ps->uid << 16) | mask; }
+// PS 2D samplers whose bound texture is a shadow-map depth texture.
+static uint16_t shadow_mask(Shader *ps) {
+    uint16_t m = 0;
+    for (uint32_t u = ps->sm.samplers_used, i = 0; u; u >>= 1, i++) {
+        if (!(u & 1) || ps->sm.sampler_type[i] != 2) continue;
+        Obj *o = D->st.tex[i];
+        if (o && o->kind == K_TEX && static_cast<Texture *>(o)->shadow) m |= 1 << i;
+    }
+    return m;
+}
+static Program *program_for_pair(Shader *vs, Shader *ps) {
+    uint64_t k = prog_key(vs, ps, 0);
+    auto it = D->sm_progs.find(k);
+    if (it != D->sm_progs.end()) return it->second;
+    Program *p = get_program_slow(nullptr, vs, ps);
+    D->sm_progs[k] = p;
+    return p;
+}
+// A new shader exists: link it with every remembered partner that is alive.
+static void pairs_warm(Shader *s) {
+    pairs_load();
+    g_shader_by_hash[s->hash] = s;
+    auto it = g_pair_partners.find(s->hash);
+    if (it == g_pair_partners.end() || !s->ok) return;
+    for (uint64_t h : it->second) {
+        auto o = g_shader_by_hash.find(h);
+        if (o == g_shader_by_hash.end() || !o->second->ok || o->second->kind == s->kind) continue;
+        Shader *vs = s->kind == K_VS ? s : o->second, *ps = s->kind == K_PS ? s : o->second;
+        if (g_pairs.count({vs->hash, ps->hash})) program_for_pair(vs, ps);
+    }
+}
+Shader::~Shader() {
+    auto it = g_shader_by_hash.find(hash);
+    if (it != g_shader_by_hash.end() && it->second == this) g_shader_by_hash.erase(it);
+}
+
 static Program *get_program(Decl *decl) {
     DevState &st = D->st;
     Shader *vs = st.vs && st.vs->ok ? st.vs : nullptr;
     Shader *ps = st.ps && st.ps->ok ? st.ps : nullptr;
-    std::string key = std::to_string((uintptr_t)vs) + "/" + std::to_string((uintptr_t)ps);
+    if (!vs || !ps) return get_program_slow(decl, vs, ps, ps ? shadow_mask(ps) : 0);   // fixed-function parts depend on render state
+    uint16_t mask = shadow_mask(ps);
+    if (D->last_prog && D->last_vs == vs->uid && D->last_ps == ps->uid && D->last_mask == mask) return D->last_prog;
+    uint64_t k = prog_key(vs, ps, mask);
+    auto it = D->sm_progs.find(k);
+    Program *p = it != D->sm_progs.end() ? it->second : nullptr;
+    if (!p) {
+        p = get_program_slow(decl, vs, ps, mask);
+        D->sm_progs[k] = p;
+        pairs_load();
+        if (!g_pairs.count({vs->hash, ps->hash})) {
+            pairs_add(vs->hash, ps->hash);
+            if (FILE *f = fopen(pairs_path().c_str(), "a")) { fprintf(f, "%016llx %016llx\n", (unsigned long long)vs->hash, (unsigned long long)ps->hash); fclose(f); }
+        }
+    }
+    D->last_prog = p; D->last_vs = vs->uid; D->last_ps = ps->uid; D->last_mask = mask;
+    return p;
+}
+static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask) {
+    DevState &st = D->st;
+    std::string key = std::to_string(vs ? vs->uid : 0) + "/" + std::to_string(ps ? ps->uid : 0) + "#" + std::to_string(mask);
     std::string vsrc, psrc, k1, k2;
     SmShader ffps_if, ffvs_if;
     if (!vs) {
@@ -839,11 +986,12 @@ static Program *get_program(Decl *decl) {
     auto it = D->progs.find(key);
     if (it != D->progs.end()) return &it->second;
     if (vs) { ffps_if = ff_ps_iface(); vsrc = sm_vs_source(vs->sm, ps ? &ps->sm : &ffps_if); }
-    if (ps) { ffvs_if = ff_vs_iface(decl, st); psrc = sm_ps_source(ps->sm, vs ? &vs->sm : &ffvs_if); }
+    if (ps) { ffvs_if = ff_vs_iface(decl, st); psrc = sm_ps_source(ps->sm, vs ? &vs->sm : &ffvs_if, mask); }
     Program &p = D->progs[key];
-    p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps;
+    p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps; p.shadow_mask = mask;
     GLuint a = compile_shader(GL_VERTEX_SHADER, vsrc), b = compile_shader(GL_FRAGMENT_SHADER, psrc);
     p.prog = glCreateProgram();
+    D->links++;
     glAttachShader(p.prog, a); glAttachShader(p.prog, b);
     glLinkProgram(p.prog);
     GLint ok = 0; glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
@@ -852,52 +1000,90 @@ static Program *get_program(Decl *decl) {
         rtlog("d3d9: program link failed: %s\nVS:\n%s\nPS:\n%s", log, vsrc.c_str(), psrc.c_str());
     }
     glDeleteShader(a); glDeleteShader(b);
-    glUseProgram(p.prog);
+    use_program(p.prog);
     auto U = [&](const char *n) { return glGetUniformLocation(p.prog, n); };
     p.vc = U("vc"); p.vi = U("vi"); p.vb = U("vb"); p.pc = U("pc"); p.pi = U("pi"); p.pb = U("pb");
     p.posFixup = U("posFixup"); p.alphaFunc = U("alphaFunc"); p.alphaRef = U("alphaRef"); p.vfaceSign = U("vfaceSign");
     p.fogColor = U("fogColor"); p.fogParams = U("fogParams");
     char nm[16];
+    if (p.vc >= 0) { p.vcl.resize(256); for (int i = 0; i < 256; i++) { snprintf(nm, sizeof nm, "vc[%d]", i); p.vcl[i] = U(nm); } }
+    if (p.pc >= 0) { p.pcl.resize(224); for (int i = 0; i < 224; i++) { snprintf(nm, sizeof nm, "pc[%d]", i); p.pcl[i] = U(nm); } }
     for (int i = 0; i < 16; i++) { snprintf(nm, sizeof nm, "ps_s%d", i); GLint l = U(nm); if (l >= 0) glUniform1i(l, i); }
     for (int i = 0; i < 4; i++) { snprintf(nm, sizeof nm, "vs_s%d", i); GLint l = U(nm); if (l >= 0) glUniform1i(l, 16 + i); }
     return &p;
 }
 
+// Upload float registers whose version is newer than what program p has, in contiguous runs;
+// shader-local "def" constants always win over the device values.
+// Upload the float registers changed after version `have`, as runs of consecutive uniform locations;
+// shader-local "def" constants always win over the device values.
+static void upload_float_regs(int ps, const std::vector<GLint> &locs, int nregs, const float (*vals)[4], const uint64_t *ver,
+                              uint64_t have, const SmShader &sm) {
+    if (locs.empty()) return;
+    float run[256][4];
+    int i, end;
+    changed_span(ps, have, nregs, i, end);
+    nregs = std::min(nregs, end);
+    while (i < nregs) {
+        if (ver[i] <= have || locs[i] < 0) { i++; continue; }
+        int j = i + 1;
+        while (j < nregs && ver[j] > have && locs[j] == locs[j - 1] + 1) j++;
+        memcpy(run, vals[i], 16 * (j - i));
+        for (auto &d : sm.fdefs) if (d.first >= i && d.first < j) memcpy(run[d.first - i], d.second.data(), 16);
+        glUniform4fv(locs[i], j - i, &run[0][0]);
+        i = j;
+    }
+}
 static void upload_consts(Program *p) {
     DevState &st = D->st;
     if (p->vs && p->vs_ver != D->vs_ver) {
-        float buf[256][4];
-        memcpy(buf, st.vsf, sizeof buf);
-        for (auto &d : p->vs->sm.fdefs) if (d.first < 256) memcpy(buf[d.first], d.second.data(), 16);
-        if (p->vc >= 0) glUniform4fv(p->vc, 256, &buf[0][0]);
-        int ib[16][4]; memcpy(ib, st.vsi, sizeof ib);
-        for (auto &d : p->vs->sm.idefs) if (d.first < 16) memcpy(ib[d.first], d.second.data(), 16);
-        if (p->vi >= 0) glUniform4iv(p->vi, 16, &ib[0][0]);
-        int bb[16]; memcpy(bb, st.vsb, sizeof bb);
-        for (auto &d : p->vs->sm.bdefs) if (d.first < 16) bb[d.first] = d.second;
-        if (p->vb >= 0) glUniform1iv(p->vb, 16, bb);
+        if (p->vs_ver == 0) {   // first use: everything, defs included
+            float buf[256][4];
+            memcpy(buf, st.vsf, sizeof buf);
+            for (auto &d : p->vs->sm.fdefs) if (d.first < 256) memcpy(buf[d.first], d.second.data(), 16);
+            if (p->vc >= 0) glUniform4fv(p->vc, 256, &buf[0][0]);
+        } else upload_float_regs(0, p->vcl, 256, st.vsf, D->vsf_ver, p->vs_ver, p->vs->sm);
+        if (p->vs_ver == 0 || D->vsib_ver > p->vs_ver) {
+            int ib[16][4]; memcpy(ib, st.vsi, sizeof ib);
+            for (auto &d : p->vs->sm.idefs) if (d.first < 16) memcpy(ib[d.first], d.second.data(), 16);
+            if (p->vi >= 0) glUniform4iv(p->vi, 16, &ib[0][0]);
+            int bb[16]; memcpy(bb, st.vsb, sizeof bb);
+            for (auto &d : p->vs->sm.bdefs) if (d.first < 16) bb[d.first] = d.second;
+            if (p->vb >= 0) glUniform1iv(p->vb, 16, bb);
+        }
         p->vs_ver = D->vs_ver;
     }
     if (p->ps && p->ps_ver != D->ps_ver) {
-        float buf[224][4];
-        memcpy(buf, st.psf, sizeof buf);
-        for (auto &d : p->ps->sm.fdefs) if (d.first < 224) memcpy(buf[d.first], d.second.data(), 16);
-        if (p->pc >= 0) glUniform4fv(p->pc, 224, &buf[0][0]);
-        int ib[16][4]; memcpy(ib, st.psi, sizeof ib);
-        for (auto &d : p->ps->sm.idefs) if (d.first < 16) memcpy(ib[d.first], d.second.data(), 16);
-        if (p->pi >= 0) glUniform4iv(p->pi, 16, &ib[0][0]);
-        int bb[16]; memcpy(bb, st.psb, sizeof bb);
-        for (auto &d : p->ps->sm.bdefs) if (d.first < 16) bb[d.first] = d.second;
-        if (p->pb >= 0) glUniform1iv(p->pb, 16, bb);
+        if (p->ps_ver == 0) {
+            float buf[224][4];
+            memcpy(buf, st.psf, sizeof buf);
+            for (auto &d : p->ps->sm.fdefs) if (d.first < 224) memcpy(buf[d.first], d.second.data(), 16);
+            if (p->pc >= 0) glUniform4fv(p->pc, 224, &buf[0][0]);
+        } else upload_float_regs(1, p->pcl, 224, st.psf, D->psf_ver, p->ps_ver, p->ps->sm);
+        if (p->ps_ver == 0 || D->psib_ver > p->ps_ver) {
+            int ib[16][4]; memcpy(ib, st.psi, sizeof ib);
+            for (auto &d : p->ps->sm.idefs) if (d.first < 16) memcpy(ib[d.first], d.second.data(), 16);
+            if (p->pi >= 0) glUniform4iv(p->pi, 16, &ib[0][0]);
+            int bb[16]; memcpy(bb, st.psb, sizeof bb);
+            for (auto &d : p->ps->sm.bdefs) if (d.first < 16) bb[d.first] = d.second;
+            if (p->pb >= 0) glUniform1iv(p->pb, 16, bb);
+        }
         p->ps_ver = D->ps_ver;
     }
     Viewport &v = st.vp;
-    if (p->posFixup >= 0) glUniform4f(p->posFixup, v.w ? 1.0f / v.w : 0, v.h ? 1.0f / v.h : 0, 0, 0);
+    if (p->posFixup >= 0) {
+        float fx = v.w ? 1.0f / v.w : 0, fy = v.h ? 1.0f / v.h : 0;
+        if (fx != p->u_fix[0] || fy != p->u_fix[1]) { glUniform4f(p->posFixup, fx, fy, 0, 0); p->u_fix[0] = fx; p->u_fix[1] = fy; }
+    }
     uint32_t *rs = st.rs;
-    if (p->alphaFunc >= 0) glUniform1i(p->alphaFunc, rs[15] ? (int)rs[25] : 8);
-    if (p->alphaRef >= 0) glUniform1f(p->alphaRef, (rs[24] & 255) / 255.0f);
-    if (p->vfaceSign >= 0) glUniform1f(p->vfaceSign, 1.0f);
-    if (p->fogColor >= 0) { uint32_t fc = rs[34]; glUniform4f(p->fogColor, ((fc >> 16) & 255) / 255.f, ((fc >> 8) & 255) / 255.f, (fc & 255) / 255.f, 1.0f); }
+    if (p->alphaFunc >= 0) { int af = rs[15] ? (int)rs[25] : 8; if (af != p->u_afunc) { glUniform1i(p->alphaFunc, af); p->u_afunc = af; } }
+    if (p->alphaRef >= 0) { float ar = (rs[24] & 255) / 255.0f; if (ar != p->u_aref) { glUniform1f(p->alphaRef, ar); p->u_aref = ar; } }
+    if (p->vfaceSign >= 0 && !p->u_vface) { glUniform1f(p->vfaceSign, 1.0f); p->u_vface = true; }
+    if (p->fogColor >= 0) {
+        uint32_t fc = rs[34];
+        float r = ((fc >> 16) & 255) / 255.f, g = ((fc >> 8) & 255) / 255.f, b = (fc & 255) / 255.f;
+        if (r != p->u_fogc[0] || g != p->u_fogc[1] || b != p->u_fogc[2]) { glUniform4f(p->fogColor, r, g, b, 1.0f); p->u_fogc[0] = r; p->u_fogc[1] = g; p->u_fogc[2] = b; }
+    }
     if (p->fogParams >= 0) {
         float mode = 0;
         bool sm3ps = p->ps && p->ps->sm.major >= 3;
@@ -905,7 +1091,8 @@ static void upload_consts(Program *p) {
             if (rs[35] == 0) mode = rs[140] || !p->ff_vs ? 1.0f : 0.0f;   // vertex fog (factor from VS)
             else mode = rs[35] == 3 ? 2.0f : rs[35] == 1 ? 3.0f : 4.0f;  // table fog LINEAR/EXP/EXP2
         }
-        glUniform4f(p->fogParams, mode, fl(rs[36]), fl(rs[37]), fl(rs[38]));
+        float fp[4] = {mode, fl(rs[36]), fl(rs[37]), fl(rs[38])};
+        if (memcmp(fp, p->u_fog, sizeof fp)) { glUniform4fv(p->fogParams, 1, fp); memcpy(p->u_fog, fp, sizeof fp); }
     }
     if (p->ff_vs || p->ff_ps) {
         GLuint g = p->prog;
@@ -1031,8 +1218,11 @@ static Decl *current_decl() {
 // bind vertex attributes; returns number of instances (1 if no instancing)
 static int setup_attribs(Decl *decl, Program *p, GLuint up_buf, uint32_t up_stride, uint32_t base_vertex) {
     uint32_t enabled = 0;
+    // D3D9 instancing is on whenever stream 0 is INDEXEDDATA, even for a count of 1: the
+    // INSTANCEDATA streams must then advance per instance, never per vertex.
     int instances = 1;
-    if ((D->st.streams[0].freq >> 30) == 1) instances = std::max<int>(1, D->st.streams[0].freq & 0x3FFFFFFF);
+    bool instancing = (D->st.streams[0].freq >> 30) == 1;
+    if (instancing) { instances = std::max<int>(1, D->st.streams[0].freq & 0x3FFFFFFF); D->inst_draws++; if (instances == 1) D->inst1_draws++; }
     if (!decl) goto done;
     for (auto &e : decl->el) {
         int loc = -1;
@@ -1051,10 +1241,15 @@ static int setup_attribs(Decl *decl, Program *p, GLuint up_buf, uint32_t up_stri
             if (!s.vb) continue;
             buf = s.vb->buf; stride = s.stride; off = s.offset + e.offset + base_vertex * s.stride;
         }
-        glBindBuffer(GL_ARRAY_BUFFER, buf);
-        glVertexAttribPointer(loc, af.size, af.type, af.norm, stride, (const void *)(uintptr_t)off);
-        bool inst = instances > 1 && e.stream > 0 && (s.freq >> 30) == 2;
-        glVertexAttribDivisor(loc, inst ? (s.freq & 0x3FFFFFFF) : 0);
+        bool inst = instancing && e.stream > 0 && (s.freq >> 30) == 2;
+        GLuint div = inst ? (s.freq & 0x3FFFFFFF) : 0;
+        AttrBind &a = D->attr[loc];
+        if (a.buf != buf || a.size != af.size || a.type != af.type || a.norm != af.norm || a.stride != (GLsizei)stride || a.off != off) {
+            glBindBuffer(GL_ARRAY_BUFFER, buf);
+            glVertexAttribPointer(loc, af.size, af.type, af.norm, stride, (const void *)(uintptr_t)off);
+            a.buf = buf; a.size = af.size; a.type = af.type; a.norm = af.norm; a.stride = stride; a.off = off;
+        }
+        if (a.div != div) { glVertexAttribDivisor(loc, div); a.div = div; }
         enabled |= 1u << loc;
     }
 done:
@@ -1073,18 +1268,28 @@ static void bind_textures(Program *p) {
         if (!used) continue;
         if (D->samp_dirty[i]) apply_sampler(i);
         Texture *t = static_cast<Texture *>(D->st.tex[i]);
-        glActiveTexture(GL_TEXTURE0 + i);
         GLenum want = GL_TEXTURE_2D;
         if (p->ps && i < 16) want = p->ps->sm.sampler_type[i] == 3 ? GL_TEXTURE_CUBE_MAP : p->ps->sm.sampler_type[i] == 4 ? GL_TEXTURE_3D : GL_TEXTURE_2D;
         if (p->vs && i >= 16) want = p->vs->sm.sampler_type[i - 16] == 3 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+        GLenum target = want; GLuint tex = 0;
         if (t && t->tex) {
             if (!p->ps && i < 16) want = t->target;
-            glBindTexture(t->target, t->tex);
-            if (t->target != want) glBindTexture(want, 0);
-        } else glBindTexture(want, 0);
-        glBindSampler(i, D->samplers[i]);
+            if (t->target == want) { target = want; tex = t->tex; }
+        }
+        TexBind &b = D->tex_bound[i];
+        if (b.target != target || b.tex != tex) {
+            active_unit(i);
+            glBindTexture(target, tex);
+            b = {target, tex};
+        }
+        bool cmp = i < 16 && ((p->shadow_mask >> i) & 1);
+        if (cmp != D->samp_cmp[i]) {
+            glSamplerParameteri(D->samplers[i], GL_TEXTURE_COMPARE_MODE, cmp ? GL_COMPARE_REF_TO_TEXTURE : GL_NONE);
+            glSamplerParameteri(D->samplers[i], GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+            D->samp_cmp[i] = cmp;
+        }
+        if (!D->samp_bound[i]) { glBindSampler(i, D->samplers[i]); D->samp_bound[i] = true; }
     }
-    glActiveTexture(GL_TEXTURE0);
 }
 
 static GLenum prim_mode(uint32_t t, uint32_t n, uint32_t *count) {
@@ -1100,12 +1305,13 @@ static GLenum prim_mode(uint32_t t, uint32_t n, uint32_t *count) {
 }
 
 static Program *prepare_draw() {
+    D->draws++;
     bind_rt_fbo();
     if (D->vp_dirty) apply_viewport();
     if (D->rs_dirty) apply_render_state();
     Decl *decl = current_decl();
     Program *p = get_program(decl);
-    glUseProgram(p->prog);
+    use_program(p->prog);
     upload_consts(p);
     bind_textures(p);
     if (D->rt[0] && D->rt[0]->container) D->rt[0]->container->rendered = true;   // mips need regeneration
@@ -1198,6 +1404,9 @@ static void reset_state() {
     set_indices(nullptr); set_decl(nullptr); st.fvf = 0;
     set_shader(false, nullptr); set_shader(true, nullptr);
     D->vs_ver++; D->ps_ver++;
+    note_consts(0, 0, 256, D->vs_ver);
+    note_consts(1, 0, 224, D->ps_ver);
+    D->vsib_ver = D->vs_ver; D->psib_ver = D->ps_ver;
     D->rs_dirty = true;
 }
 
@@ -1265,6 +1474,9 @@ static void debug_shot() {
     rtlog("d3d9: saved %s", path);
 }
 
+int post_aa_mode();
+bool post_present(int mode, GLuint bb, int bw, int bh, int dx, int dy, int dw, int dh);
+
 static void present() {
     if (!D->backbuf) return;
     debug_shot();
@@ -1284,8 +1496,50 @@ static void present() {
     double sx = (double)ww / bw, sy = (double)wh / bh, s = std::min(sx, sy);
     int dw = (int)(bw * s + 0.5), dh = (int)(bh * s + 0.5);
     int dx = (ww - dw) / 2, dy = (wh - dh) / 2;
-    glBlitFramebuffer(0, 0, bw, bh, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (post_present(post_aa_mode(), D->backbuf->gl_tex(), bw, bh, dx, dy, dw, dh)) {
+        glBindVertexArray(D->vao);
+        gl_cache_reset();
+    } else {
+        glBlitFramebuffer(0, 0, bw, bh, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
+    if (getenv("FVR_SHOT_POST")) {   // debug: dump what reaches the window (after FXAA / FSR)
+        static const char *frames = getenv("FVR_SHOT_FRAMES");
+        static const char *dir = getenv("FVR_SHOT_DIR");
+        char key[32]; snprintf(key, sizeof key, ",%llu,", (unsigned long long)D->frame);
+        if (frames && dir && (std::string(",") + frames + ",").find(key) != std::string::npos) {
+            std::vector<uint8_t> px((size_t)ww * wh * 4);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            glReadBuffer(GL_BACK);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, ww, wh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            char path[1024]; snprintf(path, sizeof path, "%s/win_%05llu.ppm", dir, (unsigned long long)D->frame);
+            if (FILE *o = fopen(path, "wb")) {
+                fprintf(o, "P6\n%d %d\n255\n", ww, wh);
+                for (int y = wh - 1; y >= 0; y--) for (int x = 0; x < ww; x++) fwrite(&px[((size_t)y * ww + x) * 4], 1, 3, o);
+                fclose(o);
+            }
+        }
+    }
     SDL_GL_SwapWindow(g_win);
+    if (getenv("FVR_FPS")) {   // frame pacing stats every 2 s: average fps, worst frame, draw calls per frame
+        static uint64_t t_last = SDL_GetPerformanceCounter(), t_win = t_last;
+        static double worst = 0; static int nfr = 0;
+        uint64_t now = SDL_GetPerformanceCounter();
+        double dt = (double)(now - t_last) / SDL_GetPerformanceFrequency();
+        t_last = now; worst = std::max(worst, dt); nfr++;
+        static uint64_t l0, t0, u0, m0;
+        if (dt > 0.025) rtlog("fps: slow frame %.1f ms: %llu links, %llu new textures, %llu KB uploaded, %llu mip regens", dt * 1000,
+                              (unsigned long long)(D->links - l0), (unsigned long long)(D->tex_new - t0),
+                              (unsigned long long)((D->upload_bytes - u0) >> 10), (unsigned long long)(D->mipgens - m0));
+        l0 = D->links; t0 = D->tex_new; u0 = D->upload_bytes; m0 = D->mipgens;
+        double win = (double)(now - t_win) / SDL_GetPerformanceFrequency();
+        if (win >= 2.0) {
+            rtlog("fps: %.1f avg, worst frame %.1f ms, per frame: %llu draws (%llu instanced, %llu with 1 instance, %llu UP), %llu locks",
+                  nfr / win, worst * 1000, (unsigned long long)(D->draws / nfr), (unsigned long long)(D->inst_draws / nfr),
+                  (unsigned long long)(D->inst1_draws / nfr), (unsigned long long)(D->up_draws / nfr), (unsigned long long)(D->locks / nfr));
+            t_win = now; worst = 0; nfr = 0; D->draws = D->inst_draws = D->inst1_draws = D->up_draws = D->locks = 0;
+        }
+    }
     D->fbo_dirty = true;
     D->rs_dirty = true;
     D->vp_dirty = true;
@@ -1405,7 +1659,7 @@ static void upload_surface_rect(Surface *dst, uint32_t dx, uint32_t dy, uint32_t
     GLuint tex = dst->gl_tex();
     if (!tex) return;
     GLenum tgt = dst->gl_target();
-    glBindTexture(dst->container && dst->container->kind == K_CUBE ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, tex);
+    scratch_bind(dst->container && dst->container->kind == K_CUBE ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     if (fi->compressed) {
         glCompressedTexSubImage2D(tgt, dst->level, dx, dy, w, h, fi->internal, pitch * fmt_rows(fi, h), src);
@@ -1504,7 +1758,7 @@ M(dev_StretchRect) {
                       depth ? (GL_DEPTH_BUFFER_BIT | (fs->stencil ? GL_STENCIL_BUFFER_BIT : 0)) : GL_COLOR_BUFFER_BIT,
                       depth || ARG(5) == 1 ? GL_NEAREST : GL_LINEAR);
     D->fbo_dirty = true; D->rs_dirty = true;
-    if (dst->container && dst->container->autogen && dst->level == 0) { glBindTexture(dst->container->target, dst->container->tex); glGenerateMipmap(dst->container->target); }
+    if (dst->container && dst->container->autogen && dst->level == 0) { scratch_bind(dst->container->target, dst->container->tex); glGenerateMipmap(dst->container->target); }
     RETN(6, D3D_OK);
 }
 M(dev_ColorFill) {
@@ -1677,7 +1931,7 @@ M(dev_SetTexture) {
     if (D->recording) D->recording->tex[i] = true;
     if (t && t->kind != K_SURF) {
         Texture *tx = static_cast<Texture *>(t);
-        if (tx->rendered && tx->autogen && tx->tex) { glBindTexture(tx->target, tx->tex); glGenerateMipmap(tx->target); tx->rendered = false; }
+        if (tx->rendered && tx->autogen && tx->tex) { scratch_bind(tx->target, tx->tex); glGenerateMipmap(tx->target); tx->rendered = false; D->mipgens++; }
     }
     RETN(3, D3D_OK);
 }
@@ -1732,7 +1986,7 @@ M(dev_DrawIndexedPrimitive) {
     Program *p = prepare_draw();
     int base = (int)ARG(2);
     int inst = setup_attribs(current_decl(), p, 0, 0, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->buf);
+    if (D->cur_ebo != ib->buf) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->buf); D->cur_ebo = ib->buf; }
     bool i32 = ib->fmt == 102;
     const void *off = (const void *)(uintptr_t)(ARG(5) * (i32 ? 4 : 2));
     GLenum it = i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
@@ -1746,6 +2000,7 @@ M(dev_DrawPrimitiveUP) {
     uint32_t stride = ARG(4);
     if (!count) RETN(5, D3D_OK);
     set_stream(0, nullptr, 0, 0);
+    D->up_draws++;
     Program *p = prepare_draw();
     glBindBuffer(GL_ARRAY_BUFFER, D->up_vbo);
     glBufferData(GL_ARRAY_BUFFER, count * stride, H(ARG(3)), GL_STREAM_DRAW);
@@ -1766,7 +2021,7 @@ M(dev_DrawIndexedPrimitiveUP) {
     glBindBuffer(GL_ARRAY_BUFFER, D->up_vbo);
     glBufferData(GL_ARRAY_BUFFER, (minv + nv) * stride, H(ARG(7)), GL_STREAM_DRAW);
     setup_attribs(current_decl(), p, D->up_vbo, stride, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, D->up_ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, D->up_ibo); D->cur_ebo = D->up_ibo;
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, count * (i32 ? 4 : 2), H(ARG(5)), GL_STREAM_DRAW);
     glDrawElements(mode, count, i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, nullptr);
     RETN(9, D3D_OK);
@@ -1796,12 +2051,18 @@ M(dev_SetFVF) {
 M(dev_GetFVF) { GUARD; W32(ARG(1), D->st.decl ? D->st.decl->fvf : D->st.fvf); RETN(2, D3D_OK); }
 
 static Shader *make_shader(Kind k, uint32_t code) {
+    static uint32_t next_uid = 1;
     Shader *s = new Shader(k);
+    s->uid = next_uid++;
     const uint32_t *t = (const uint32_t *)H(code);
     size_t len = sm_length(t, 1 << 20);
     s->code.assign(t, t + len);
+    uint64_t h = 1469598103934665603ull;   // FNV-1a over the bytecode
+    for (uint32_t w : s->code) { h ^= w; h *= 1099511628211ull; }
+    s->hash = h ^ (k == K_PS ? 0x9e3779b97f4a7c15ull : 0);
     s->ok = sm_translate(s->code.data(), s->code.size(), s->sm);
     if (!s->ok) rtlog("d3d9: shader translation failed (%s): %s", k == K_VS ? "vs" : "ps", s->sm.error.c_str());
+    pairs_warm(s);
     return s;
 }
 M(dev_CreateVertexShader) { GUARD; Shader *s = make_shader(K_VS, ARG(1)); W32(ARG(2), obj_publish(s, g_vt[K_VS])); RETN(3, D3D_OK); }
@@ -1813,12 +2074,13 @@ M(dev_SetVertexShaderConstantF) {
     memcpy(D->st.vsf[st], H(ARG(2)), 16 * n);
     if (D->recording) for (uint32_t i = 0; i < n; i++) D->recording->vsf[st + i] = true;
     D->vs_ver++;
+    note_consts(0, st, st + n, D->vs_ver);
     RETN(4, D3D_OK);
 }
 M(dev_GetVertexShaderConstantF) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 256) memcpy(H(ARG(2)), D->st.vsf[st], 16 * n); RETN(4, D3D_OK); }
-M(dev_SetVertexShaderConstantI) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(D->st.vsi[st], H(ARG(2)), 16 * n); if (D->recording) D->recording->vsi = true; D->vs_ver++; RETN(4, D3D_OK); }
+M(dev_SetVertexShaderConstantI) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(D->st.vsi[st], H(ARG(2)), 16 * n); if (D->recording) D->recording->vsi = true; D->vsib_ver = ++D->vs_ver; RETN(4, D3D_OK); }
 M(dev_GetVertexShaderConstantI) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(H(ARG(2)), D->st.vsi[st], 16 * n); RETN(4, D3D_OK); }
-M(dev_SetVertexShaderConstantB) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(&D->st.vsb[st], H(ARG(2)), 4 * n); if (D->recording) D->recording->vsb = true; D->vs_ver++; RETN(4, D3D_OK); }
+M(dev_SetVertexShaderConstantB) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(&D->st.vsb[st], H(ARG(2)), 4 * n); if (D->recording) D->recording->vsb = true; D->vsib_ver = ++D->vs_ver; RETN(4, D3D_OK); }
 M(dev_GetVertexShaderConstantB) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(H(ARG(2)), &D->st.vsb[st], 4 * n); RETN(4, D3D_OK); }
 M(dev_SetStreamSource) {
     GUARD;
@@ -1846,12 +2108,13 @@ M(dev_SetPixelShaderConstantF) {
     memcpy(D->st.psf[st], H(ARG(2)), 16 * n);
     if (D->recording) for (uint32_t i = 0; i < n; i++) D->recording->psf[st + i] = true;
     D->ps_ver++;
+    note_consts(1, st, st + n, D->ps_ver);
     RETN(4, D3D_OK);
 }
 M(dev_GetPixelShaderConstantF) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 224) memcpy(H(ARG(2)), D->st.psf[st], 16 * n); RETN(4, D3D_OK); }
-M(dev_SetPixelShaderConstantI) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(D->st.psi[st], H(ARG(2)), 16 * n); if (D->recording) D->recording->psi = true; D->ps_ver++; RETN(4, D3D_OK); }
+M(dev_SetPixelShaderConstantI) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(D->st.psi[st], H(ARG(2)), 16 * n); if (D->recording) D->recording->psi = true; D->psib_ver = ++D->ps_ver; RETN(4, D3D_OK); }
 M(dev_GetPixelShaderConstantI) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(H(ARG(2)), D->st.psi[st], 16 * n); RETN(4, D3D_OK); }
-M(dev_SetPixelShaderConstantB) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(&D->st.psb[st], H(ARG(2)), 4 * n); if (D->recording) D->recording->psb = true; D->ps_ver++; RETN(4, D3D_OK); }
+M(dev_SetPixelShaderConstantB) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(&D->st.psb[st], H(ARG(2)), 4 * n); if (D->recording) D->recording->psb = true; D->psib_ver = ++D->ps_ver; RETN(4, D3D_OK); }
 M(dev_GetPixelShaderConstantB) { GUARD; uint32_t st = ARG(1), n = ARG(3); if (st + n <= 16) memcpy(H(ARG(2)), &D->st.psb[st], 4 * n); RETN(4, D3D_OK); }
 M(dev_DrawRectPatch) { RETN(4, D3DERR_INVALIDCALL); }
 M(dev_DrawTriPatch) { RETN(4, D3DERR_INVALIDCALL); }
@@ -1921,16 +2184,19 @@ M(d3d_CheckDeviceFormat) {
     if (!fi) r = D3DERR_NOTAVAILABLE;
     else if ((usage & 2) && !fi->depth) r = D3DERR_NOTAVAILABLE;         // DEPTHSTENCIL
     else if ((usage & 1) && (fi->compressed || fi->depth)) r = D3DERR_NOTAVAILABLE;   // RENDERTARGET
-    else if (fi->depth && rtype == 3 && !(fmt == FOURCC('I','N','T','Z') || fmt == FOURCC('D','F','2','4') || fmt == FOURCC('D','F','1','6'))) r = D3DERR_NOTAVAILABLE;
+    // depth textures: INTZ / DF24 / DF16 read back depth, the others work as hardware shadow maps
     else if (usage & 0x00080000) r = D3DERR_NOTAVAILABLE;   // QUERY_VERTEXTEXTURE on exotic formats: keep it simple
     if (fmt == 32 || fmt == 33) r = D3DERR_NOTAVAILABLE;      // A8B8G8R8 not exposed by D3D9 ATI drivers
     if (trace() || r) rtlog("d3d9: CheckDeviceFormat usage %x rtype %u fmt %08x -> %s", usage, rtype, fmt, r ? "no" : "ok");
     RETN(7, r);
 }
 M(d3d_CheckDeviceMultiSampleType) {
+    // Types 2 and 3 are offered to the game's AA menu and mapped to FXAA / FSR post-processing
+    // (d3d9_post.cpp); surfaces created with them are not really multisampled.
     uint32_t ms = ARG(5);
-    if (ARG(6)) W32(ARG(6), ms == 0 ? 1 : 0);
-    RETN(7, ms == 0 ? D3D_OK : D3DERR_NOTAVAILABLE);
+    bool ok = ms == 0 || ms == 2 || ms == 3;
+    if (ARG(6)) W32(ARG(6), ok ? 1 : 0);
+    RETN(7, ok ? D3D_OK : D3DERR_NOTAVAILABLE);
 }
 M(d3d_CheckDepthStencilMatch) { RETN(6, D3D_OK); }
 M(d3d_CheckDeviceFormatConversion) { RETN(5, D3D_OK); }
@@ -1962,6 +2228,13 @@ M(d3d_CreateDevice) {
     SDL_GL_MakeCurrent(g_win, g_ctx);
     g_ctx_thread = pthread_self(); g_ctx_bound = true;
     rtlog("d3d9: OpenGL %s / %s", glGetString(GL_VERSION), glGetString(GL_RENDERER));
+    {   // Apple's multithreaded GL engine moves driver validation off the game thread (FVR_GL_MT=0 disables)
+        const char *mt = getenv("FVR_GL_MT");
+        if (!mt || strcmp(mt, "0")) {
+            CGLError e = CGLEnable(CGLGetCurrentContext(), kCGLCEMPEngine);
+            rtlog("d3d9: multithreaded GL engine %s", e == kCGLNoError ? "on" : "unavailable");
+        }
+    }
     glGenVertexArrays(1, &D->vao);
     glBindVertexArray(D->vao);
     glGenBuffers(1, &D->up_vbo);
@@ -2144,7 +2417,7 @@ bool d3d9_put_rgba(uint32_t surf, int x0, int y0, int w, int h, const std::vecto
     if (!fi || fi->depth) return false;
     if (s->gl_tex() && !s->mem && !(s->container && s->container->sysmem())) {
         if (fi->compressed) { rtlog("d3dx: writing RGBA into a compressed GL surface is not supported"); return false; }
-        glBindTexture(s->container && s->container->kind == K_CUBE ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, s->gl_tex());
+        scratch_bind(s->container && s->container->kind == K_CUBE ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, s->gl_tex());
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         glTexSubImage2D(s->gl_target(), s->level, x0, y0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, in.data());

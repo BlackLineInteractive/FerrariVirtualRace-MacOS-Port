@@ -2,7 +2,7 @@
 
 A native macOS (`x86_64`) port of *Ferrari Virtual Race* (2009) created by statically recompiling the original 32-bit Windows executable (`FerrariVR_Hi.exe`) into C and pairing it with a custom Win32 / DirectX host runtime built on SDL3 and OpenGL 4.1 Core.
 
-![In-game screenshot on Mugello](media/gameplay_mugello.png)
+![In-game screenshot on Mugello](media/gameplay.jpg)
 
 > **Note:** This repository contains no original game binaries, copyrighted code, or game assets. You must supply your own copy of *Ferrari Virtual Race* to generate the recompiled C sources and run the game.
 
@@ -101,15 +101,14 @@ On first launch, [config.cpp](runtime/config.cpp) automatically writes a default
 
 If you would like to support the project or follow updates:
 
-- Ko-fi - https://ko-fi.com/blacklineinteractive
-- Patreon - https://www.patreon.com/BlacklineInteractive
-- YouTube - https://youtube.com/@blacklineinteractive
-- X - https://x.com/demonv559
-- Instagram - https://www.instagram.com/blacklineinteractive
-- TikTok - https://www.tiktok.com/@blacklineinteractive
-- LinkedIn - https://linkedin.com/in/blacklineinteractive
+- Ko-fi - <https://ko-fi.com/blacklineinteractive>
+- Patreon - <https://www.patreon.com/BlacklineInteractive>
+- YouTube - <https://youtube.com/@blacklineinteractive>
+- X - <https://x.com/demonv559>
+- Instagram - <https://www.instagram.com/blacklineinteractive>
+- TikTok - <https://www.tiktok.com/@blacklineinteractive>
+- LinkedIn - <https://linkedin.com/in/blacklineinteractive>
 
 ## License
 
 This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-

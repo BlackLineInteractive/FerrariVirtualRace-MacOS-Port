@@ -1,4 +1,5 @@
 // user32 / gdi32 replacement on top of SDL3: windows, message queue, keyboard and mouse.
+#include <algorithm>
 #include "rt.h"
 #include "win32ui.h"
 #include <SDL3/SDL.h>
@@ -200,7 +201,48 @@ static uint32_t mk_bits() {
 }
 static uint32_t pos_lp() { return ((uint32_t)(uint16_t)g_mouse_x) | ((uint32_t)(uint16_t)g_mouse_y << 16); }
 
+// Debug: scripted key presses, FVR_KEYS="ms:Key[:holdms],..." (ms since first pump, SDL key names).
+// Lets automated runs walk menus; DirectInput sees them through ui_key_injected().
+static bool g_inject[SDL_SCANCODE_COUNT];
+bool ui_key_injected(SDL_Scancode s) { return s < SDL_SCANCODE_COUNT && g_inject[s]; }
+static void scripted_keys() {
+    struct Ev { uint64_t t; SDL_Scancode sc; bool down; };
+    static std::vector<Ev> evs; static size_t next; static uint64_t t0; static bool loaded;
+    if (!loaded) {
+        loaded = true;
+        const char *k = getenv("FVR_KEYS");
+        if (!k) return;
+        t0 = SDL_GetTicks();
+        std::string all = k;
+        size_t pos = 0;
+        while (pos < all.size()) {
+            size_t end = all.find(',', pos); if (end == std::string::npos) end = all.size();
+            std::string item = all.substr(pos, end - pos); pos = end + 1;
+            size_t c1 = item.find(':'); if (c1 == std::string::npos) continue;
+            size_t c2 = item.find(':', c1 + 1);
+            uint64_t t = strtoull(item.c_str(), nullptr, 10);
+            std::string name = item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
+            uint64_t hold = c2 == std::string::npos ? 120 : strtoull(item.c_str() + c2 + 1, nullptr, 10);
+            SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
+            if (sc == SDL_SCANCODE_UNKNOWN) { rtlog("FVR_KEYS: unknown key %s", name.c_str()); continue; }
+            evs.push_back({t, sc, true}); evs.push_back({t + hold, sc, false});
+        }
+        std::stable_sort(evs.begin(), evs.end(), [](const Ev &a, const Ev &b) { return a.t < b.t; });
+    }
+    uint64_t now = SDL_GetTicks() - t0;
+    if (next < evs.size() && evs[next].t <= now) {   // one change per pump so DirectInput polls see it
+        const Ev &v = evs[next++];
+        g_inject[v.sc] = v.down;
+        SDL_KeyboardEvent k = {};
+        k.type = v.down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+        k.scancode = v.sc; k.key = SDL_GetKeyFromScancode(v.sc, SDL_KMOD_NONE, false); k.down = v.down;
+        if (getenv("FVR_TRACE")) rtlog("FVR_KEYS: %s %s at %llu ms", SDL_GetScancodeName(v.sc), v.down ? "down" : "up", (unsigned long long)now);
+        on_key(k);
+    }
+}
+
 void ui_pump() {
+    scripted_keys();
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         ui_extra_event(e);   // DirectInput: wheel, joystick hot-plug
@@ -294,7 +336,7 @@ API(user32, CreateWindowExA, 12) {
     if (w <= 0 || (uint32_t)w == 0x80000000u) w = 800;
     if (h <= 0 || (uint32_t)h == 0x80000000u) h = 600;
     const char *t = GS(title) ? GS(title) : "";
-    SDL_Window *sw = SDL_CreateWindow(t, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    SDL_Window *sw = SDL_CreateWindow(t, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!sw) { rtlog("SDL_CreateWindow failed: %s", SDL_GetError()); RETN(12, 0); }
     uint32_t hwnd = g_next_hwnd; g_next_hwnd += 4;
     Win &wi = g_windows[hwnd];

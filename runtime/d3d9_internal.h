@@ -76,6 +76,7 @@ struct Texture : Obj {
     uint32_t lod = 0;
     bool autogen = false;
     bool rendered = false;      // rendered to since mips were last generated
+    bool shadow = false;        // depth format sampled as a depth comparison (D16 / D24X8 / D24S8 ...)
     bool sysmem() const { return pool == 2 || pool == 3; }
     ~Texture();
 };
@@ -104,6 +105,9 @@ struct Shader : Obj {
     explicit Shader(Kind k) : Obj(k) {}
     SmShader sm;
     bool ok = false;
+    uint32_t uid = 0;           // unique for the process lifetime (program cache key)
+    uint64_t hash = 0;          // of the bytecode (persistent shader-pair cache)
+    ~Shader();
     std::vector<uint32_t> code;
 };
 

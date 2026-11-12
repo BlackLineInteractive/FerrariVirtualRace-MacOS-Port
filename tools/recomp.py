@@ -389,7 +389,7 @@ class FuncTranslator:
                 if t != a + insn.size or insn.mnemonic.split()[-1] == "jmp":
                     self.labels.add(t)
         name = self.rc.fname(self.entry)
-        o = [f"void {name}(CPU *c) {{"]
+        o = [f"void {name}(CPU *restrict c) {{"]
         if min(self.ins) != self.entry:
             self.labels.add(self.entry)
             o.append(f"  goto L_{self.entry:x};")
@@ -439,6 +439,8 @@ class FuncTranslator:
         a = insn.address
         nxt = a + insn.size
         live = self.live_out.get(a, 0)
+        if a in self.rc.hooks:
+            return [f"{self.rc.hooks[a]}(c);"]
         prefix_rep = insn.prefix[0] in (0xF3, 0xF2)
 
         if m in ("les", "lds", "lcall", "ljmp", "into", "in", "out", "iretd"):
@@ -837,6 +839,14 @@ class Recompiler:
                 line = line.split("#")[0].strip()
                 if line:
                     self.func_entries.add(int(line, 16))
+        # host hooks: replace one guest instruction with a call into the runtime ("addr name" per line)
+        self.hooks = {}
+        hk = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks.txt")
+        if os.path.exists(hk):
+            for line in open(hk):
+                line = line.split("#")[0].split()
+                if len(line) == 2:
+                    self.hooks[int(line[0], 16)] = line[1]
         self.unsupported = collections.Counter()
         self.missing_calls = set()
         import fpu
@@ -927,6 +937,7 @@ class Recompiler:
         entries = sorted(self.func_entries)
         hdr = ['#include "cpu.h"']
         hdr += [f"void {self.fname(a)}(CPU *c);" for a in entries]
+        hdr += [f"void {n}(CPU *c);" for n in sorted(set(self.hooks.values()))]
         open(os.path.join(self.outdir, "funcs.h"), "w").write("\n".join(hdr) + "\n")
         chunk, n_chunk, out = [], 0, []
         notes = []

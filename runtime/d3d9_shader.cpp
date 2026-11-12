@@ -395,7 +395,16 @@ struct Tr {
             std::string cs = src(c);
             int ty = sn < 16 ? S.sampler_type[sn] : 2;
             std::string e;
-            if (op == OP_TEXLDL) e = "textureLod(" + sname + ", " + coord(sn, cs) + ", (" + cs + ").w)";
+            if (ps && ty == 2 && sn < 16) {
+                // 2D pixel samplers go through helpers defined by sm_ps_source, which can turn them
+                // into depth-compare (shadow map) lookups when a depth texture is bound.
+                if (op == OP_TEXLDL) e = fmt("t2l_%d(%s)", sn, cs.c_str());
+                else if (op == OP_TEXLDD) e = fmt("t2g_%d(%s, %s, %s)", sn, cs.c_str(), src(dx).c_str(), src(dy).c_str());
+                else if (ctrl & 1) e = fmt("t2p_%d(%s)", sn, cs.c_str());
+                else if (ctrl & 2) e = fmt("t2b_%d(%s)", sn, cs.c_str());
+                else e = fmt("t2_%d(%s)", sn, cs.c_str());
+            }
+            else if (op == OP_TEXLDL) e = "textureLod(" + sname + ", " + coord(sn, cs) + ", (" + cs + ").w)";
             else if (op == OP_TEXLDD) e = "textureGrad(" + sname + ", " + coord(sn, cs) + ", " + coord(sn, src(dx)) + ", " + coord(sn, src(dy)) + ")";
             else if (ctrl & 1) {   // texldp
                 if (ty == 2) e = "textureProj(" + sname + ", (" + cs + ").xyw)";
@@ -664,15 +673,32 @@ std::string sm_vs_source(const SmShader &vs, const SmShader *ps) {
     return s;
 }
 
-std::string sm_ps_source(const SmShader &ps, const SmShader *vs) {
+std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow_mask) {
     (void)vs;
     std::string s = "#version 410 core\n";
     s += PRELUDE;
     s += "uniform vec4 pc[256];\nuniform ivec4 pi[16];\nuniform bool pb[16];\n";
     s += "uniform int alphaFunc;\nuniform float alphaRef;\nuniform float vfaceSign;\n";
     s += "uniform vec4 fogColor;\nuniform vec4 fogParams;\n";   // x: mode (0 off), y: start, z: end, w: density
-    for (int i = 0; i < 16; i++)
-        if (ps.samplers_used & (1 << i)) s += fmt("uniform %s ps_s%d;\n", sampler_glsl(ps.sampler_type[i]), i);
+    for (int i = 0; i < 16; i++) {
+        if (!(ps.samplers_used & (1 << i))) continue;
+        if (ps.sampler_type[i] != 2) { s += fmt("uniform %s ps_s%d;\n", sampler_glsl(ps.sampler_type[i]), i); continue; }
+        if (shadow_mask & (1 << i)) {   // D3D "hardware shadow map": compare against coord.z, filtered (PCF)
+            s += fmt("uniform sampler2DShadow ps_s%d;\n", i);
+            s += fmt("vec4 t2_%d(vec4 c) { return vec4(texture(ps_s%d, c.xyz)); }\n", i, i);
+            s += fmt("vec4 t2p_%d(vec4 c) { return vec4(textureProj(ps_s%d, c)); }\n", i, i);
+            s += fmt("vec4 t2b_%d(vec4 c) { return vec4(texture(ps_s%d, c.xyz, c.w)); }\n", i, i);
+            s += fmt("vec4 t2l_%d(vec4 c) { return vec4(textureLod(ps_s%d, c.xyz, c.w)); }\n", i, i);
+            s += fmt("vec4 t2g_%d(vec4 c, vec4 x, vec4 y) { return vec4(textureGrad(ps_s%d, c.xyz, x.xy, y.xy)); }\n", i, i);
+        } else {
+            s += fmt("uniform sampler2D ps_s%d;\n", i);
+            s += fmt("vec4 t2_%d(vec4 c) { return texture(ps_s%d, c.xy); }\n", i, i);
+            s += fmt("vec4 t2p_%d(vec4 c) { return textureProj(ps_s%d, c.xyw); }\n", i, i);
+            s += fmt("vec4 t2b_%d(vec4 c) { return texture(ps_s%d, c.xy, c.w); }\n", i, i);
+            s += fmt("vec4 t2l_%d(vec4 c) { return textureLod(ps_s%d, c.xy, c.w); }\n", i, i);
+            s += fmt("vec4 t2g_%d(vec4 c, vec4 x, vec4 y) { return textureGrad(ps_s%d, c.xy, x.xy, y.xy); }\n", i, i);
+        }
+    }
     std::set<std::string> declared;
     for (auto &i : ps.inputs) {
         std::string v = sm_varying(i.usage, i.index);

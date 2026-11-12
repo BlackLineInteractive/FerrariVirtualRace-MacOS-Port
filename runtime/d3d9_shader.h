@@ -36,7 +36,8 @@ size_t sm_length(const uint32_t *tokens, size_t max_tokens);
 
 // Final GLSL sources for a VS/PS pair (varyings are matched by usage/index).
 std::string sm_vs_source(const SmShader &vs, const SmShader *ps);
-std::string sm_ps_source(const SmShader &ps, const SmShader *vs);
+// shadow_mask: 2D samplers bound to depth textures (sampled as depth comparisons).
+std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow_mask = 0);
 
 // Name of the varying that carries a semantic.
 std::string sm_varying(int usage, int index);
