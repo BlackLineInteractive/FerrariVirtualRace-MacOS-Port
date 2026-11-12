@@ -97,6 +97,18 @@ On first launch, [config.cpp](runtime/config.cpp) automatically writes a default
 
 - **Inspection Scripts (`tools/`)** - Helper scripts for PE layout inspection ([peinfo.py](tools/peinfo.py)), locating embedded D3D9 shaders ([find_shaders.py](tools/find_shaders.py)), and quick disassembly ([x86dis.py](tools/x86dis.py)).
 
+## Support & Links
+
+If you would like to support the project or follow updates:
+
+- Ko-fi - https://ko-fi.com/blacklineinteractive
+- Patreon - https://www.patreon.com/BlacklineInteractive
+- YouTube - https://youtube.com/@blacklineinteractive
+- X - https://x.com/demonv559
+- Instagram - https://www.instagram.com/blacklineinteractive
+- TikTok - https://www.tiktok.com/@blacklineinteractive
+- LinkedIn - https://linkedin.com/in/blacklineinteractive
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
