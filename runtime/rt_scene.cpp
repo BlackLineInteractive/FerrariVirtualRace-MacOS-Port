@@ -576,33 +576,57 @@ void rt_frame_end(uint64_t frame, const float *vp, const float *ivp) {
 
 // The GPU view (FVR_RT_VIEW): this frame's TLAS, built now (the scene pass is done), and one primary
 // ray per pixel traced by Metal into an image OpenGL can read.
-unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w, int h, int mode) {
-    if (frame != g_frame || !rtm_available()) return 0;
+// This frame's TLAS (built now: the scene pass is done) and instances, BLAS data uploaded.
+static std::vector<RtmInst> g_gi;
+static double g_tlas_ms;
+static bool gpu_frame(uint64_t frame, const float *vp) {
+    if (frame != g_frame || !rtm_available()) return false;
     auto t0 = Clock::now();
     if (g_built != frame) { g_built = frame; if (!build_tlas(vp)) g_inst.clear(); }
-    double tlas_ms = ms_since(t0);
-    if (g_inst.empty() || g_pnodes.empty()) return 0;
-    t0 = Clock::now();
+    g_tlas_ms = ms_since(t0);
+    if (g_inst.empty() || g_pnodes.empty()) return false;
     rtm_blas(g_pnodes.data(), g_pnodes.size(), g_up_nodes, g_ptris.data(), g_ptris.size(), g_up_tris);
     g_up_nodes = g_pnodes.size(); g_up_tris = g_ptris.size();
     if (g_merged_new && g_merged) { rtm_merged(g_merged->nodes.data(), g_merged->nodes.size(), g_merged->tris.data(), g_merged->tris.size()); g_merged_new = false; }
-    static std::vector<RtmInst> gi;
-    gi.resize(g_inst.size());
+    g_gi.resize(g_inst.size());
     for (size_t i = 0; i < g_inst.size(); i++) {
-        memcpy(gi[i].w2o, g_inst[i].iw, 48);
+        memcpy(g_gi[i].w2o, g_inst[i].iw, 48);
         bool merged = g_merged && g_inst[i].b == g_merged->blas.get();
-        gi[i].node_base = merged ? 0 : g_inst[i].b->node_base;
-        gi[i].tri_base = merged ? 0 : g_inst[i].b->tri_base;
-        gi[i].tint = 0; gi[i].pad = merged;
+        g_gi[i].node_base = merged ? 0 : g_inst[i].b->node_base;
+        g_gi[i].tri_base = merged ? 0 : g_inst[i].b->tri_base;
+        g_gi[i].tint = 0; g_gi[i].pad = merged;
     }
+    return true;
+}
+
+unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w, int h, int mode) {
+    auto t0 = Clock::now();
+    if (!gpu_frame(frame, vp)) return 0;
     double gpu = 0;
-    unsigned tex = rtm_trace_view(gi.data(), gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), ivp, w, h, mode, &gpu);
+    unsigned tex = rtm_trace_view(g_gi.data(), g_gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), ivp, w, h, mode, &gpu);
     double all = ms_since(t0);
     static uint64_t last;
     if (stats_on() && SDL_GetTicks() - last >= 1000) {
         last = SDL_GetTicks();
-        rtlog("rt: GPU view %dx%d: Metal %.2f ms (wall %.2f ms incl. upload), TLAS %.2f ms, %zu instances (%zu remembered, %zu waiting for the merge, merged track %u triangles), BLAS data %.1f MB",
-              w, h, gpu, all, tlas_ms, g_inst.size(), g_world_kept, g_merge_pending, g_merged ? g_merged->blas->tris : 0, (g_pnodes.size() + g_ptris.size()) * 16 / 1048576.0);
+        rtlog("rt: GPU view %dx%d: Metal %.2f ms (wall %.2f ms incl. TLAS and upload), TLAS %.2f ms, %zu instances (%zu remembered, %zu waiting for the merge, merged track %u triangles), BLAS data %.1f MB",
+              w, h, gpu, all, g_tlas_ms, g_inst.size(), g_world_kept, g_merge_pending, g_merged ? g_merged->blas->tris : 0,
+              (g_pnodes.size() + g_ptris.size()) * 16 / 1048576.0);
+    }
+    return tex;
+}
+
+unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam) {
+    auto t0 = Clock::now();
+    if (!gpu_frame(frame, vp)) return 0;
+    double gpu = 0;
+    uint32_t rays = 0;
+    unsigned tex = rtm_trace_reflect(g_gi.data(), g_gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), cam, &rays, &gpu);
+    double all = ms_since(t0);
+    static uint64_t last;
+    if (stats_on() && SDL_GetTicks() - last >= 1000) {
+        last = SDL_GetTicks();
+        rtlog("rt: reflections: %u rays, Metal %.2f ms (wall %.2f ms incl. TLAS %.2f ms and upload), %zu instances, merged track %u triangles",
+              rays, gpu, all, g_tlas_ms, g_inst.size(), g_merged ? g_merged->blas->tris : 0);
     }
     return tex;
 }

@@ -8,6 +8,7 @@
 #include "win32ui.h"
 #include "rt_scene.h"
 #include "pbr.h"
+#include "rt_metal.h"
 #include <mutex>
 #include <unordered_map>
 #include <set>
@@ -111,6 +112,7 @@ struct Program {
     int u_afunc = -1; bool u_vface = false;
     uint16_t shadow_mask = 0;      // PS samplers compiled as sampler2DShadow
     bool vel = false;              // velocity variant (temporal AA scene pass): vcp / velOn uniforms
+    bool rtmask = false;           // writes the ray-tracing reflection mask (PBR car material, rt=1)
     GLint vcp = -1, velOn = -1; float u_velon = -1;
     std::vector<GLint> vcl, pcl;   // location of every vc[i] / pc[i] (-1 if optimised away)
 };
@@ -164,6 +166,10 @@ static struct Device {
     Surface *taa_rt = nullptr;       // game surface stood in for (identity only, not referenced)
     int taa_lw = 0, taa_lh = 0; float taa_sx = 1, taa_sy = 1, taa_lod = 0;
     GLuint taa_fbo = 0, taa_col = 0, taa_dep = 0, taa_vel = 0;
+    GLuint taa_m0 = 0, taa_m1 = 0;   // ray-tracing reflection mask (attachments 2, 3; IOSurface rectangle textures)
+    int rtm_state = -1;              // colour mask of attachments 2 and 3
+    GLuint rt_cube = 0;              // the car's reflection cube this frame (fallback for off-screen hits)
+    float rt_cam[3] = {}; bool rt_cam_ok = false;   // CameraPos of the car draws
     uint64_t taa_frame = ~0ull, taa_last = ~0ull;
     float taa_jit[2] = {};
     int vel_mask = -1;
@@ -902,6 +908,7 @@ static GLuint taa_tex(GLuint t, GLenum ifmt, GLenum fmt, GLenum type, int w, int
     return t;
 }
 static void taa_timer(int point);
+static bool rt_reflections();
 static void taa_bind() {
     float s = post_temporal_scale();
     uint32_t w = D->backbuf->w, h = D->backbuf->h;
@@ -915,8 +922,16 @@ static void taa_bind() {
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, D->taa_col, 0);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, D->taa_vel, 0);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, D->taa_dep, 0);
-        GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
-        glDrawBuffers(2, bufs);
+        D->taa_m0 = D->taa_m1 = 0;
+        unsigned m0, m1;
+        if (rt_reflections() && rtm_mask_textures(lw, lh, &m0, &m1)) {
+            D->taa_m0 = m0; D->taa_m1 = m1;
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_RECTANGLE, m0, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_RECTANGLE, m1, 0);
+        }
+        GLenum bufs[4] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3};
+        glDrawBuffers(D->taa_m0 ? 4 : 2, bufs);
+        D->rtm_state = -1;
         GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         rtlog("d3d9: temporal AA targets %dx%d for %ux%u (fbo %s)", lw, lh, w, h, st == GL_FRAMEBUFFER_COMPLETE ? "ok" : "INCOMPLETE");
         D->taa_lw = lw; D->taa_lh = lh;
@@ -1013,6 +1028,7 @@ static void vel_setup(Program *p, uint64_t dkey) {
 }
 // End of frame: this frame's draws become the previous ones.
 static void vel_frame_end() {
+    D->rt_cam_ok = false; D->rt_cube = 0;
     bool drawn = D->taa_frame == D->frame;
     if (drawn && D->ivp_ok) rt_frame_end(D->frame, D->vp_cur, D->ivp_cur);
     D->ivp_ok = false;
@@ -1049,6 +1065,9 @@ static float fvr_option(const char *name, float def) {
 }
 // Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 keeps the scene's acceleration structures;
 // rt_view=1 also traces it on the GPU and shows that instead of the game's image (a check).
+GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint cube, const float *vp, const float *ivp, const float *cam);
+// rt=1: ray-traced reflections on the mirror-like car surfaces (PBR material, implies pbr=1)
+static bool rt_reflections() { static bool on = fvr_option("rt", 0) > 0; return on; }
 static int rt_view_mode() { static int v = (int)fvr_option("rt_view", 0); return v; }
 static bool rt_enabled() { static bool on = fvr_option("rt", 0) > 0 || rt_view_mode() > 0; return on; }
 // Copies the ray-traced image (rectangle texture, w x h) over the scene colour (lw x lh).
@@ -1072,6 +1091,12 @@ static void taa_resolve(Surface *dst) {
     if (rt_view_mode() > 0 && D->ivp_ok) {
         if (GLuint rect = rt_trace_view(D->frame, D->vp_cur, D->ivp_cur, D->taa_lw, D->taa_lh, rt_view_mode())) rt_show(rect, D->taa_lw, D->taa_lh, col, D->taa_lw, D->taa_lh);
     }
+    if (D->taa_m0 && D->rt_cam_ok && D->vp_cur_ok) {   // reflection rays where the car material asked for them
+        float ivp2[16];
+        if (mat4_inv(D->vp_cur, ivp2))
+            if (GLuint hit = rt_trace_reflect(D->frame, D->vp_cur, D->rt_cam))
+                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, D->rt_cube, D->vp_cur, ivp2, D->rt_cam);
+    }
     static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
     float ivp[16];
     if ((ssr > 0 || ao > 0) && D->vp_cur_ok && mat4_inv(D->vp_cur, ivp)) {
@@ -1090,7 +1115,7 @@ static void taa_resolve(Surface *dst) {
     glBindVertexArray(D->vao);
     gl_cache_reset();
     D->fbo_dirty = D->rs_dirty = D->vp_dirty = true;
-    D->vel_mask = -1;
+    D->vel_mask = -1; D->rtm_state = -1;
 }
 
 // clear_flags: D3DCLEAR_* about to cover the whole target (skips copying stale texture contents in)
@@ -1101,7 +1126,7 @@ static void bind_rt_fbo(uint32_t clear_flags = 0) {
     D->taa_bound = taa_eligible();
     if (D->taa_bound != was_taa) {
         D->vp_dirty = D->rs_dirty = true;
-        D->vel_mask = -1;
+        D->vel_mask = -1; D->rtm_state = -1;
         for (int i = 0; i < 16; i++) D->samp_dirty[i] = true;   // texture LOD bias
     }
     if (D->taa_bound) { taa_bind(); D->fbo_dirty = false; return; }
@@ -1216,7 +1241,7 @@ static void apply_render_state() {
     uint32_t cw = rs[168];
     glColorMaski(0, cw & 1, (cw >> 1) & 1, (cw >> 2) & 1, (cw >> 3) & 1);
     for (int i = 1; i < 4; i++) { uint32_t m = rs[189 + i]; glColorMaski(i, m & 1, (m >> 1) & 1, (m >> 2) & 1, (m >> 3) & 1); }
-    D->vel_mask = -1;
+    D->vel_mask = -1; D->rtm_state = -1;
     // stencil
     if (rs[52] && D->ds) {
         glEnable(GL_STENCIL_TEST);
@@ -1390,21 +1415,23 @@ static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t ma
     }
     auto it = D->progs.find(key);
     if (it != D->progs.end()) return &it->second;
+    bool pbr_replaced = false;
     if (vs) { ffps_if = ff_ps_iface(); vsrc = sm_vs_source(vs->sm, ps ? &ps->sm : &ffps_if, vel); }
     if (ps) {
         ffvs_if = ff_vs_iface(decl, st);
         // pbr=1: the car material's main() is replaced (pbr.cpp)
-        static bool pbr_on = (pbr_configure(fvr_option("pbr", 0) > 0), fvr_option("pbr", 0) > 0);
+        static bool pbr_on = (pbr_configure(fvr_option("pbr", 0) > 0 || rt_reflections(), rt_reflections()), fvr_option("pbr", 0) > 0 || rt_reflections());
         SmShader alt;
         const SmShader *src = &ps->sm;
+        pbr_replaced = false;
         if (pbr_on) {
             std::string funcs = ps->sm.funcs, body;
-            if (pbr_car_shader(ps->hash, funcs, body)) { alt = ps->sm; alt.funcs = funcs; alt.body = body; src = &alt; }
+            if (pbr_car_shader(ps->hash, funcs, body)) { alt = ps->sm; alt.funcs = funcs; alt.body = body; src = &alt; pbr_replaced = true; }
         }
         psrc = sm_ps_source(*src, vs ? &vs->sm : &ffvs_if, mask, vel);
     }
     Program &p = D->progs[key];
-    p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps; p.shadow_mask = mask; p.vel = vel;
+    p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps; p.shadow_mask = mask; p.vel = vel; p.rtmask = pbr_replaced && pbr_writes_mask();
     GLuint a = compile_shader(GL_VERTEX_SHADER, vsrc), b = compile_shader(GL_FRAGMENT_SHADER, psrc);
     p.prog = glCreateProgram();
     D->links++;
@@ -1866,6 +1893,16 @@ static Program *prepare_draw(uint64_t dkey = 0) {
         int want = p->vel && !D->st.rs[27];
         if (want != D->vel_mask) { glColorMaski(1, want, want, want, want); D->vel_mask = want; }
         if (p->vel) vel_setup(p, dkey);
+        if (D->taa_m0) {   // reflection mask: written only by the PBR car material, never blended
+            int want = p->rtmask;
+            if (want != D->rtm_state) { glColorMaski(2, want, want, want, want); glColorMaski(3, want, want, want, want); D->rtm_state = want; }
+            if (want) {
+                if (D->st.rs[27]) { glBlendFunci(2, GL_ONE, GL_ZERO); glBlendFunci(3, GL_ONE, GL_ZERO); }
+                Texture *cube = (Texture *)D->st.tex[9];
+                if (cube && cube->target == GL_TEXTURE_CUBE_MAP) D->rt_cube = cube->tex;
+                memcpy(D->rt_cam, D->st.vsf[24], 12); D->rt_cam_ok = true;
+            }
+        }
     }
     if (p->bakedFlat >= 0) baked_flat(p);
     bind_textures(p);
@@ -2437,6 +2474,11 @@ M(dev_Clear) {
             glScissor(tsx(x0), tsy(y0), tsx(x1) - tsx(x0), tsy(y1) - tsy(y0));
             glClear(mask);
             if (D->taa_bound && (flags & 1)) { static const float unk[4] = {0, 0, 1, 0}; glClearBufferfv(GL_COLOR, 1, unk); }
+            if (D->taa_bound && (flags & 1) && D->taa_m0) {
+                static const float zero[4] = {0, 0, 0, 0};
+                glClearBufferfv(GL_COLOR, 2, zero); glClearBufferfv(GL_COLOR, 3, zero);
+                D->rtm_state = -1;
+            }
         }
     }
     D->rs_dirty = true;

@@ -23,6 +23,8 @@
 #include <cstring>
 #include <string>
 
+static bool g_rt;   // pbr_configure
+
 namespace {
 
 // helpers placed before main()
@@ -108,6 +110,15 @@ std::string body(const char *N, const char *V, const char *S, const char *FOG, c
     float p_coat = dot(p_Fv, vec3(0.3333));
     float p_a0 = pc[0].w;
 )GLSL";
+    if (g_rt) b += R"GLSL(
+    // ray-traced reflections: mirror-like pixels (GGX alpha <= 0.15) get one ray instead of the
+    // cube map; the weight is what the cube map would have been multiplied by
+    float p_w = dot((p_F0 * p_ab.x + p_ab.y) * p_envw, vec3(0.3333));
+    bool p_ray = p_a <= 0.15 && p_w > 0.003;
+    if (p_ray) p_envs = vec3(0.0);
+    oRtM0 = vec4(p_R, p_a);
+    oRtM1 = vec4(-@V.xyz, p_ray ? p_w : 0.0);
+)GLSL";
     if (textured) b += R"GLSL(
     vec3 p_col = p_lit * (1.0 - p_metal) * (1.0 - p_coat) + p_spec + p_envs;
     float p_alpha = p_tex.a * pc[0].w;
@@ -131,7 +142,7 @@ std::string body(const char *N, const char *V, const char *S, const char *FOG, c
 }   // namespace
 
 static int g_pbr = 0;
-void pbr_configure(bool on) { g_pbr = on; }
+void pbr_configure(bool on, bool rt) { g_pbr = on; g_rt = on && rt; }
 
 bool pbr_car_shader(uint64_t hash, std::string &funcs, std::string &main_body) {
     if (g_pbr <= 0) return false;
@@ -146,5 +157,8 @@ bool pbr_car_shader(uint64_t hash, std::string &funcs, std::string &main_body) {
         return false;
     }
     funcs += kFuncs;
+    if (g_rt) funcs += "layout(location = 2) out vec4 oRtM0;\nlayout(location = 3) out vec4 oRtM1;\n";
     return true;
 }
+
+bool pbr_writes_mask() { return g_rt; }

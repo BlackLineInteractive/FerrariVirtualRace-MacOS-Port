@@ -72,7 +72,8 @@ int main(int argc, char **argv) {
             uint64_t hh = 1469598103934665603ull;
             for (size_t w = 0; w < len; w++) { hh ^= t[w]; hh *= 1099511628211ull; }
             hh ^= 0x9e3779b97f4a7c15ull;
-            pbr_configure(true);
+            for (int v_rt = 0; v_rt < 2; v_rt++) {
+            pbr_configure(true, v_rt);
             SmShader alt = s;
             std::string funcs = s.funcs, body;
             if (pbr_car_shader(hh, funcs, body)) {
@@ -82,6 +83,7 @@ int main(int argc, char **argv) {
                     pbr_total++;
                     if (!compile(GL_FRAGMENT_SHADER, psrc, log)) { gl_fail++; printf("%06zx pbr%s: GL FAIL\n%s\n", off, v ? " (velocity)" : "", log.c_str()); if (verbose) printf("%s\n", psrc.c_str()); }
                 }
+            }
             }
         }
         // temporal AA velocity variant

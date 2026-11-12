@@ -839,3 +839,101 @@ GLuint post_ao(GLuint col, GLuint dep, int w, int h, const float *vp, const floa
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
     return g_ao.tex;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ray-traced reflections (rt=1): Metal traced one ray for each pixel the PBR car material marked
+// (m0 = direction, m1 = position - camera and weight) and left the hit points in `hit`. The colour
+// at a hit is the frame's own colour where the hit point is visible on screen (exact reflection,
+// with parallax and contact), otherwise the game's reflection cube in that direction (also for
+// misses: the sky). Added to the scene colour with the material's weight.
+static const char *kRtFS = R"(#version 410 core
+uniform sampler2D col, dep;
+uniform sampler2DRect m0, m1, hit;
+uniform samplerCube env;
+uniform int haveEnv, dbg;
+uniform mat4 VP, IVP;
+uniform vec3 cam;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = texelFetch(col, p, 0);
+    o = c;
+    vec4 b = texelFetch(m1, p);
+    if (!(b.w > 0.0)) { if (dbg != 0) o.rgb *= 0.25; return; }
+    vec3 R = normalize(texelFetch(m0, p).xyz);
+    vec4 h = texelFetch(hit, p);
+    vec3 L = haveEnv != 0 ? textureLod(env, R, 0.0).rgb : vec3(0.0);
+    int kind = 0;                                  // 0 cube (miss / off screen), 1 screen
+    if (h.w > 0.5 && h.w < 1.5) {
+        vec4 q = VP * vec4(h.xyz, 1.0);
+        if (q.w > 0.0) {
+            vec3 n = q.xyz / q.w;
+            vec2 uv = vec2(n.x * 0.5 + 0.5, 0.5 - 0.5 * n.y);
+            if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+                float sz = textureLod(dep, uv, 0.0).r;
+                vec4 sp = IVP * vec4(n.xy, sz, 1.0);
+                vec3 S = sp.xyz / sp.w;
+                float d = length(h.xyz - cam);
+                if (length(S - h.xyz) < 0.02 * d + 0.05) { L = textureLod(col, uv, 0.0).rgb; kind = 1; }
+            }
+        }
+    }
+    if (dbg == 1) { o.rgb = kind == 1 ? vec3(0.0, 1.0, 0.0) : (h.w > 1.5 ? vec3(0.0, 0.3, 1.0) : vec3(1.0, 0.2, 0.0)); return; }
+    o.rgb = c.rgb + b.w * L;
+}
+)";
+static GLuint g_rt_prog, g_rt_fbo;
+static GLint g_rt_u[12];
+static Target g_rt;
+
+GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint cube, const float *vp, const float *ivp, const float *cam) {
+    if (!init()) return col;
+    if (!g_rt_prog) {
+        GLuint vs = compile(GL_VERTEX_SHADER, kVS), fs = compile(GL_FRAGMENT_SHADER, kRtFS);
+        if (!vs || !fs) return col;
+        g_rt_prog = glCreateProgram();
+        glAttachShader(g_rt_prog, vs); glAttachShader(g_rt_prog, fs); glLinkProgram(g_rt_prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        const char *n[] = {"col", "dep", "m0", "m1", "hit", "env", "haveEnv", "dbg", "VP", "IVP", "cam"};
+        for (int i = 0; i < 11; i++) g_rt_u[i] = glGetUniformLocation(g_rt_prog, n[i]);
+        glGenFramebuffers(1, &g_rt_fbo);
+        rtlog("post: ray-traced reflections ready");
+    }
+    if (!g_rt.tex || g_rt.w != w || g_rt.h != h) {
+        if (!g_rt.tex) glGenTextures(1, &g_rt.tex);
+        glBindTexture(GL_TEXTURE_2D, g_rt.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_rt_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_rt.tex, 0);
+        g_rt.w = w; g_rt.h = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_rt_fbo);
+    GLenum b0 = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1, &b0);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_FRAMEBUFFER_SRGB);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMaski(0, 1, 1, 1, 1);
+    glViewport(0, 0, w, h);
+    glUseProgram(g_rt_prog);
+    glBindVertexArray(g_vao);
+    glActiveTexture(GL_TEXTURE0); glBindSampler(0, g_sampler); glBindTexture(GL_TEXTURE_2D, col); glUniform1i(g_rt_u[0], 0);
+    glActiveTexture(GL_TEXTURE1); glBindSampler(1, 0); glBindTexture(GL_TEXTURE_2D, dep); glUniform1i(g_rt_u[1], 1);
+    glActiveTexture(GL_TEXTURE2); glBindSampler(2, 0); glBindTexture(GL_TEXTURE_RECTANGLE, m0); glUniform1i(g_rt_u[2], 2);
+    glActiveTexture(GL_TEXTURE3); glBindSampler(3, 0); glBindTexture(GL_TEXTURE_RECTANGLE, m1); glUniform1i(g_rt_u[3], 3);
+    glActiveTexture(GL_TEXTURE4); glBindSampler(4, 0); glBindTexture(GL_TEXTURE_RECTANGLE, hit); glUniform1i(g_rt_u[4], 4);
+    glActiveTexture(GL_TEXTURE5); glBindSampler(5, g_sampler); glBindTexture(GL_TEXTURE_CUBE_MAP, cube); glUniform1i(g_rt_u[5], 5);
+    glUniform1i(g_rt_u[6], cube ? 1 : 0);
+    static int dbg = getenv("FVR_RT_DEBUG") ? atoi(getenv("FVR_RT_DEBUG")) : 0;
+    glUniform1i(g_rt_u[7], dbg);
+    glUniformMatrix4fv(g_rt_u[8], 1, GL_TRUE, vp);
+    glUniformMatrix4fv(g_rt_u[9], 1, GL_TRUE, ivp);
+    glUniform3fv(g_rt_u[10], 1, cam);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    for (int i = 5; i >= 0; i--) { glActiveTexture(GL_TEXTURE0 + i); glBindSampler(i, 0); }
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    return g_rt.tex;
+}

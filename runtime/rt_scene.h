@@ -41,3 +41,6 @@ void rt_frame_end(uint64_t frame, const float *vp, const float *ivp);
 // texture (w x h, RGBA16F) with the debug view, or 0.
 // mode 1: the camera's view, 2: looking backwards from the camera
 unsigned rt_trace_view(uint64_t frame, const float *vp, const float *ivp, int w, int h, int mode);
+// Reflection rays for the pixels the PBR car shader marked (rtm_mask_textures), from the camera at
+// `cam`. Returns the OpenGL rectangle texture of hit points (see rtm_trace_reflect), or 0.
+unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam);

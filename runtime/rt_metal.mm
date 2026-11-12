@@ -160,6 +160,32 @@ bool traceTlas(device const float4 *nodes, device const float4 *tris, device con
     return found;
 }
 
+// Reflection rays, only where the material asked for one (mask written by the PBR car shader):
+// m0 = (reflection direction, GGX alpha), m1 = (position - camera, weight; 0 = no ray).
+// out = (hit position, 1) for a hit, (0, 0, 0, 2) for a miss (sky), 0 where nothing was traced.
+struct RParams { float4 cam; uint w, h, nInst, pad; };
+kernel void rt_reflect(device const float4 *nodes [[buffer(0)]], device const float4 *tris [[buffer(1)]],
+                       device const TNode *tlas [[buffer(2)]], device const uint *prims [[buffer(3)]],
+                       device const Inst *insts [[buffer(4)]], constant RParams &P [[buffer(5)]],
+                       device const float4 *mnodes [[buffer(6)]], device const float4 *mtris [[buffer(7)]],
+                       device atomic_uint *count [[buffer(8)]],
+                       texture2d<float, access::read> m0 [[texture(0)]], texture2d<float, access::read> m1 [[texture(1)]],
+                       texture2d<float, access::write> out [[texture(2)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= P.w || gid.y >= P.h) return;
+    const float4 b = m1.read(gid);
+    if (!(b.w > 0.0f)) { out.write(float4(0.0f), gid); return; }
+    atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+    const float3 R = normalize(m0.read(gid).xyz);
+    const float3 O = P.cam.xyz + b.xyz;
+    const float tMin = 0.002f * length(b.xyz) + 0.01f;
+    float tMax = 1e5f;
+    Hit hit; hit.t = tMax; hit.n = float3(0, 1, 0); hit.inst = 0xFFFFFFFFu;
+    if (P.nInst > 0u && traceTlas(nodes, tris, mnodes, mtris, tlas, prims, insts, O, R, tMin, tMax, hit))
+        out.write(float4(O + R * hit.t, 1.0f), gid);
+    else
+        out.write(float4(0.0f, 0.0f, 0.0f, 2.0f), gid);
+}
+
 // Debug view: one primary ray per pixel, shaded by the angle to the surface, one tint per instance.
 kernel void rt_view(device const float4 *nodes [[buffer(0)]], device const float4 *tris [[buffer(1)]],
                     device const TNode *tlas [[buffer(2)]], device const uint *prims [[buffer(3)]],
@@ -197,6 +223,13 @@ kernel void rt_view(device const float4 *nodes [[buffer(0)]], device const float
 )MSL";
 
 namespace {
+// An image shared by Metal and OpenGL through an IOSurface (GL sees a rectangle texture).
+struct Img {
+    IOSurfaceRef surf = nullptr;
+    id<MTLTexture> tex;
+    GLuint gl = 0;
+    int w = 0, h = 0;
+};
 struct State {
     bool tried = false, ok = false;
     id<MTLDevice> dev;
@@ -205,11 +238,10 @@ struct State {
     id<MTLBuffer> nodes, tris;                 // BLAS data, grown as needed
     id<MTLBuffer> mnodes, mtris;               // the merged world-space BLAS
     id<MTLBuffer> frame[3];                    // instances, TLAS nodes, TLAS leaf indices
-    // output image shared with OpenGL
-    IOSurfaceRef surf = nullptr;
-    id<MTLTexture> tex;
-    GLuint gltex = 0;
-    int w = 0, h = 0;
+    Img vimg;                                  // debug view (RGBA16F)
+    Img m0, m1, hit;                           // reflection mask (from GL), hit points (to GL)
+    id<MTLComputePipelineState> reflect;
+    id<MTLBuffer> counter;
 };
 State S;
 
@@ -231,6 +263,9 @@ bool init() {
         if (!lib) { rtlog("rt: Metal kernel compile failed: %s", err.localizedDescription.UTF8String); return false; }
         S.view = [S.dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rt_view"] error:&err];
         if (!S.view) { rtlog("rt: Metal pipeline failed: %s", err.localizedDescription.UTF8String); return false; }
+        S.reflect = [S.dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rt_reflect"] error:&err];
+        if (!S.reflect) { rtlog("rt: Metal pipeline failed: %s", err.localizedDescription.UTF8String); return false; }
+        S.counter = [S.dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
         rtlog("rt: Metal ray tracing on %s", S.dev.name.UTF8String);
         S.ok = true;
     }
@@ -252,31 +287,34 @@ void upload(id<MTLBuffer> b, const void *src, size_t from, size_t to) {
     [b didModifyRange:NSMakeRange(from, to - from)];
 }
 
-bool ensure_image(int w, int h) {
-    if (S.surf && S.w == w && S.h == h) return true;
-    if (S.gltex) { glDeleteTextures(1, &S.gltex); S.gltex = 0; }
-    if (S.surf) { CFRelease(S.surf); S.surf = nullptr; }
-    S.tex = nil;
-    NSDictionary *props = @{(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @8,
-                            (id)kIOSurfacePixelFormat: @((uint32_t)'RGhA')};
-    S.surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-    if (!S.surf) { rtlog("rt: IOSurface %dx%d failed", w, h); return false; }
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:w height:h mipmapped:NO];
+// half: RGBA16F, else RGBA32F
+bool ensure_img(Img &m, int w, int h, bool half, const char *what) {
+    if (m.surf && m.w == w && m.h == h) return true;
+    if (m.gl) { glDeleteTextures(1, &m.gl); m.gl = 0; }
+    if (m.surf) { CFRelease(m.surf); m.surf = nullptr; }
+    m.tex = nil;
+    NSDictionary *props = @{(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @(half ? 8 : 16),
+                            (id)kIOSurfacePixelFormat: @((uint32_t)(half ? 'RGhA' : 'RGfA'))};
+    m.surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!m.surf) { rtlog("rt: IOSurface %dx%d failed", w, h); return false; }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(half ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA32Float)
+                                                                                 width:w height:h mipmapped:NO];
     d.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     d.storageMode = MTLStorageModeManaged;
-    S.tex = [S.dev newTextureWithDescriptor:d iosurface:S.surf plane:0];
-    if (!S.tex) { rtlog("rt: Metal texture over IOSurface failed"); return false; }
+    m.tex = [S.dev newTextureWithDescriptor:d iosurface:m.surf plane:0];
+    if (!m.tex) { rtlog("rt: Metal texture over IOSurface failed"); return false; }
     GLint prev = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prev);
-    glGenTextures(1, &S.gltex);
-    glBindTexture(GL_TEXTURE_RECTANGLE, S.gltex);
-    CGLError e = CGLTexImageIOSurface2D(CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE, GL_RGBA16F, w, h, GL_RGBA, GL_HALF_FLOAT, S.surf, 0);
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glGenTextures(1, &m.gl);
+    glBindTexture(GL_TEXTURE_RECTANGLE, m.gl);
+    CGLError e = CGLTexImageIOSurface2D(CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE, half ? GL_RGBA16F : GL_RGBA32F, w, h, GL_RGBA,
+                                        half ? GL_HALF_FLOAT : GL_FLOAT, m.surf, 0);
+    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glBindTexture(GL_TEXTURE_RECTANGLE, prev);
-    if (e != kCGLNoError) { rtlog("rt: CGLTexImageIOSurface2D failed: %d", (int)e); glDeleteTextures(1, &S.gltex); S.gltex = 0; return false; }
-    S.w = w; S.h = h;
-    rtlog("rt: shared %dx%d RGBA16F image between Metal and OpenGL", w, h);
+    if (e != kCGLNoError) { rtlog("rt: CGLTexImageIOSurface2D failed: %d", (int)e); glDeleteTextures(1, &m.gl); m.gl = 0; return false; }
+    m.w = w; m.h = h;
+    rtlog("rt: %s: %dx%d %s image shared between Metal and OpenGL", what, w, h, half ? "RGBA16F" : "RGBA32F");
     return true;
 }
 }   // namespace
@@ -303,7 +341,7 @@ void rtm_merged(const void *nodes, size_t n_nodes, const void *tris, size_t n_tr
 
 unsigned rtm_trace_view(const RtmInst *inst, size_t n_inst, const void *tlas_nodes, size_t n_tlas, const uint32_t *prim, size_t n_prim,
                         const float *ivp, int w, int h, int mode, double *gpu_ms) {
-    if (!init() || !S.nodes || !S.tris || !ensure_image(w, h)) return 0;
+    if (!init() || !S.nodes || !S.tris || !ensure_img(S.vimg, w, h, true, "debug view")) return 0;
     @autoreleasepool {
         const void *src[3] = {inst, tlas_nodes, prim};
         size_t bytes[3] = {n_inst * sizeof(RtmInst), n_tlas * 32, n_prim * 4};
@@ -326,7 +364,7 @@ unsigned rtm_trace_view(const RtmInst *inst, size_t n_inst, const void *tlas_nod
         [enc setBytes:&P length:sizeof P atIndex:5];
         [enc setBuffer:(S.mnodes ? S.mnodes : S.nodes) offset:0 atIndex:6];
         [enc setBuffer:(S.mtris ? S.mtris : S.tris) offset:0 atIndex:7];
-        [enc setTexture:S.tex atIndex:0];
+        [enc setTexture:S.vimg.tex atIndex:0];
         [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         [enc endEncoding];
         [cb commit];
@@ -337,5 +375,60 @@ unsigned rtm_trace_view(const RtmInst *inst, size_t n_inst, const void *tlas_nod
         }
         if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
     }
-    return S.gltex;
+    return S.vimg.gl;
+}
+
+bool rtm_mask_textures(int w, int h, unsigned *gl_m0, unsigned *gl_m1) {
+    if (!init()) return false;
+    if (!ensure_img(S.m0, w, h, true, "reflection mask (direction, roughness)") ||
+        !ensure_img(S.m1, w, h, false, "reflection mask (position, weight)")) return false;
+    *gl_m0 = S.m0.gl; *gl_m1 = S.m1.gl;
+    return true;
+}
+
+unsigned rtm_trace_reflect(const RtmInst *inst, size_t n_inst, const void *tlas_nodes, size_t n_tlas, const uint32_t *prim, size_t n_prim,
+                           const float *cam, uint32_t *rays, double *gpu_ms) {
+    if (!init() || !S.nodes || !S.tris || !S.m0.tex || !S.m1.tex) return 0;
+    int w = S.m1.w, h = S.m1.h;
+    if (!ensure_img(S.hit, w, h, false, "reflection hits")) return 0;
+    glFlush();   // the masks were just rendered by OpenGL
+    @autoreleasepool {
+        const void *src[3] = {inst, tlas_nodes, prim};
+        size_t bytes[3] = {n_inst * sizeof(RtmInst), n_tlas * 32, n_prim * 4};
+        for (int i = 0; i < 3; i++) {
+            bool grew;
+            S.frame[i] = ensure(S.frame[i], bytes[i] + 64, &grew);
+            upload(S.frame[i], src[i], 0, bytes[i]);
+        }
+        struct { float cam[4]; uint32_t w, h, n, pad; } P;
+        P.cam[0] = cam[0]; P.cam[1] = cam[1]; P.cam[2] = cam[2]; P.cam[3] = 0;
+        P.w = w; P.h = h; P.n = (uint32_t)n_inst; P.pad = 0;
+        *(uint32_t *)S.counter.contents = 0;
+        id<MTLCommandBuffer> cb = [S.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:S.reflect];
+        [enc setBuffer:S.nodes offset:0 atIndex:0];
+        [enc setBuffer:S.tris offset:0 atIndex:1];
+        [enc setBuffer:S.frame[1] offset:0 atIndex:2];
+        [enc setBuffer:S.frame[2] offset:0 atIndex:3];
+        [enc setBuffer:S.frame[0] offset:0 atIndex:4];
+        [enc setBytes:&P length:sizeof P atIndex:5];
+        [enc setBuffer:(S.mnodes ? S.mnodes : S.nodes) offset:0 atIndex:6];
+        [enc setBuffer:(S.mtris ? S.mtris : S.tris) offset:0 atIndex:7];
+        [enc setBuffer:S.counter offset:0 atIndex:8];
+        [enc setTexture:S.m0.tex atIndex:0];
+        [enc setTexture:S.m1.tex atIndex:1];
+        [enc setTexture:S.hit.tex atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            rtlog("rt: Metal command buffer failed: %s", cb.error.localizedDescription.UTF8String);
+            return 0;
+        }
+        if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        if (rays) *rays = *(uint32_t *)S.counter.contents;
+    }
+    return S.hit.gl;
 }
