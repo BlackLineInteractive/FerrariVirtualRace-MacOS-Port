@@ -6,6 +6,7 @@
 #include "d3d9_internal.h"
 #include <OpenGL/OpenGL.h>
 #include "win32ui.h"
+#include "rt_scene.h"
 #include <mutex>
 #include <unordered_map>
 #include <set>
@@ -168,6 +169,7 @@ static struct Device {
     std::unordered_map<uint64_t, int> vel_count;
     float vp_cur[16] = {}, vp_prev[16] = {}, vel_R[16] = {};
     bool vp_cur_ok = false, vp_prev_ok = false, vel_R_ok = false;
+    float ivp_cur[16] = {}; bool ivp_ok = false;
 } *D;
 
 static uint32_t g_vt[16];
@@ -977,6 +979,7 @@ static void vel_setup(Program *p, uint64_t dkey) {
         memcpy(D->vp_cur, c[16], 64);
         D->vp_cur_ok = true;
         float inv[16];
+        D->ivp_ok = mat4_inv(D->vp_cur, D->ivp_cur);
         D->vel_R_ok = D->vp_prev_ok && mat4_inv(D->vp_cur, inv);
         if (D->vel_R_ok) mat4_mul(D->vp_prev, inv, D->vel_R);
     }
@@ -1007,6 +1010,8 @@ static void vel_setup(Program *p, uint64_t dkey) {
 // End of frame: this frame's draws become the previous ones.
 static void vel_frame_end() {
     bool drawn = D->taa_frame == D->frame;
+    if (drawn && D->ivp_ok) rt_frame_end(D->frame, D->vp_cur, D->ivp_cur);
+    D->ivp_ok = false;
     std::swap(D->vel_prev, D->vel_cur);
     D->vel_cur.clear();
     D->vel_count.clear();
@@ -1684,6 +1689,50 @@ static GLenum prim_mode(uint32_t t, uint32_t n, uint32_t *count) {
     case 6: *count = n + 2; return GL_TRIANGLE_FAN;
     default: *count = 0; return GL_TRIANGLES;
     }
+}
+
+// ---- ray-tracing capture (rt_scene.cpp): the scene pass's draws as world-space geometry
+// Object -> world for the current draw, from the vertex shader's constant table: WorldViewProjMtx
+// (c20, multiplied by the inverse camera) or WorldMtx (c0, 3 rows). Shaders that move vertices in
+// other ways (instancing, grass, debris, sky) are not captured yet.
+static bool rt_world(RtDraw &d) {
+    Shader *vs = D->st.vs;
+    if (!vs) return false;
+    static const char *kSkip[] = {"InstWorld", "TypeVerts", "TruemmerMats", "SkyBallMtx", "MatHUD", "MatRHW", "TransMtx", "TransMat", "Anim"};
+    for (const char *n : kSkip) if (vs->ctab.count(n)) return false;
+    const float (*c)[4] = D->st.vsf;
+    if (vs->ctab_reg("WorldViewProjMtx") == 20) { memcpy(d.m, c[20], 64); d.wvp = true; return true; }
+    if (vs->ctab_reg("WorldMtx") == 0) { memcpy(d.m, c[0], 48); d.wvp = false; return true; }
+    if (vs->ctab_reg("ViewProjMtx") == 16) {   // track geometry: vertices already in world space
+        static const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        memcpy(d.m, I, 48); d.wvp = false; return true;
+    }
+    return false;
+}
+static std::string rt_shader_name(Shader *vs) {
+    if (!vs) return "fixed function";
+    std::string n;
+    for (auto &k : vs->ctab) { if (!n.empty()) n += ' '; n += k.first; }
+    return n.empty() ? "no CTAB" : n;
+}
+static void rt_note(int prim, uint32_t prims, uint32_t first, int32_t base, Buffer *ib, int inst) {
+    if (!D->taa_bound || !rt_capture_active(D->frame)) return;
+    if (inst > 1) { rt_skip(RT_SKIP_INSTANCED); return; }
+    RtDraw d{};
+    if (!rt_world(d)) { rt_skip(RT_SKIP_SHADER, rt_shader_name(D->st.vs).c_str()); return; }
+    Decl *decl = current_decl();
+    const DeclElem *pe = nullptr;
+    if (decl) for (auto &e : decl->el) if (e.usage == 0 && e.index == 0 && e.stream < 16) { pe = &e; break; }
+    if (!pe) { rt_skip(RT_SKIP_FORMAT); return; }
+    StreamSrc &st = D->st.streams[pe->stream];
+    if (!st.vb || !st.vb->mem || !st.stride) { rt_skip(RT_SKIP_UP); return; }
+    uint32_t off = st.offset + pe->offset;
+    if (off >= st.vb->size) { rt_skip(RT_SKIP_FORMAT); return; }
+    d.prim = prim; d.prims = prims; d.first = first; d.base_vertex = base;
+    d.ib = ib && ib->mem ? H(ib->mem) : nullptr; d.i32 = ib && ib->fmt == 102;
+    if (ib && !d.ib) { rt_skip(RT_SKIP_UP); return; }
+    d.pos = H(st.vb->mem) + off; d.stride = st.stride; d.pos_type = pe->type; d.vb_size = st.vb->size - off;
+    rt_capture(d);
 }
 
 // dkey: identifies the draw's geometry range (motion-vector matching across frames)
@@ -2412,6 +2461,7 @@ M(dev_DrawPrimitive) {
     if (!count) RETN(4, D3D_OK);
     Program *p = prepare_draw(((uint64_t)ARG(1) << 56) ^ ((uint64_t)ARG(2) << 24) ^ count);
     int inst = setup_attribs(current_decl(), p, 0, 0, 0);
+    rt_note((int)ARG(1), ARG(3), ARG(2), 0, nullptr, inst);
     if (inst > 1) glDrawArraysInstanced(mode, ARG(2), count, inst);
     else glDrawArrays(mode, ARG(2), count);
     RETN(4, D3D_OK);
@@ -2424,6 +2474,7 @@ M(dev_DrawIndexedPrimitive) {
     Program *p = prepare_draw(((uint64_t)ib->buf << 40) ^ ((uint64_t)ARG(2) << 32) ^ ((uint64_t)ARG(5) << 16) ^ count);
     int base = (int)ARG(2);
     int inst = setup_attribs(current_decl(), p, 0, 0, 0);
+    rt_note((int)ARG(1), ARG(6), ARG(5), base, ib, inst);
     if (D->cur_ebo != ib->buf) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->buf); D->cur_ebo = ib->buf; }
     bool i32 = ib->fmt == 102;
     const void *off = (const void *)(uintptr_t)(ARG(5) * (i32 ? 4 : 2));
@@ -2439,6 +2490,7 @@ M(dev_DrawPrimitiveUP) {
     if (!count) RETN(5, D3D_OK);
     set_stream(0, nullptr, 0, 0);
     D->up_draws++;
+    if (D->taa_bound && rt_capture_active(D->frame)) rt_skip(RT_SKIP_UP);
     Program *p = prepare_draw(0x5550000000000000ull ^ count);
     glBindBuffer(GL_ARRAY_BUFFER, D->up_vbo);
     glBufferData(GL_ARRAY_BUFFER, count * stride, H(ARG(3)), GL_STREAM_DRAW);
@@ -2499,13 +2551,27 @@ static Shader *make_shader(Kind k, uint32_t code) {
     for (uint32_t w : s->code) { h ^= w; h *= 1099511628211ull; }
     s->hash = h ^ (k == K_PS ? 0x9e3779b97f4a7c15ull : 0);
     s->ok = sm_translate(s->code.data(), s->code.size(), s->sm);
-    if (k == K_VS) {   // constant table names this game's camera matrix "ViewProjMtx" (c16)
-        const char *b = (const char *)s->code.data(), *e = b + s->code.size() * 4;
-        static const char kName[] = "ViewProjMtx";
-        for (const char *q = b; (q = (const char *)memmem(q, e - q, kName, sizeof kName)) != nullptr; q++)
-            if (q == b || !isalpha((unsigned char)q[-1])) { s->uses_vp = true; break; }
+    // constant table: the comment block fxc puts first ("CTAB"), with every uniform's name and registers
+    for (size_t p = 1; p < s->code.size();) {
+        uint32_t tok = s->code[p];
+        if ((tok & 0xFFFF) != 0xFFFE) break;
+        uint32_t n = (tok >> 16) & 0x7FFF;
+        if (n >= 7 && p + 1 + n <= s->code.size() && s->code[p + 1] == 0x42415443u) {   // 'CTAB'
+            const uint8_t *b = (const uint8_t *)&s->code[p + 2];
+            size_t bytes = (n - 1) * 4;
+            uint32_t ncon, info; memcpy(&ncon, b + 12, 4); memcpy(&info, b + 16, 4);
+            for (uint32_t c = 0; c < ncon && info + 20 * (c + 1) <= bytes; c++) {
+                uint32_t name; uint16_t set, reg, cnt;
+                memcpy(&name, b + info + 20 * c, 4); memcpy(&set, b + info + 20 * c + 4, 2);
+                memcpy(&reg, b + info + 20 * c + 6, 2); memcpy(&cnt, b + info + 20 * c + 8, 2);
+                if (name >= bytes) continue;
+                std::string nm((const char *)b + name, strnlen((const char *)b + name, bytes - name));
+                s->ctab[nm] = {reg, cnt};
+            }
+        }
+        p += 1 + n;
     }
-    if (!s->ok) rtlog("d3d9: shader translation failed (%s): %s", k == K_VS ? "vs" : "ps", s->sm.error.c_str());
+    if (k == K_VS) s->uses_vp = s->ctab_reg("ViewProjMtx") == 16;
     pairs_warm(s);
     return s;
 }

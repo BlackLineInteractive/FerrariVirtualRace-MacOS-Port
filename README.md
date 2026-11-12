@@ -122,6 +122,7 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 | `FVR_TAA_SCALE` | Override the render scale of the temporal modes (e.g. `0.75`) |
 | `FVR_FPS=1` | Print FPS every two seconds, explain slow frames, and log the GPU time of the scene, reflection and temporal passes |
 | `FVR_VSYNC=0` | Turn vertical sync off (benchmarks) |
+| `FVR_RT_DUMP=<seconds>` | Ray-tracing capture check (with a `Temporal` mode): gathers the scene of the first frame after that time as world-space triangles, builds a [tinybvh](third_party/tiny_bvh.h) BVH and saves a CPU-traced view from the game's camera as `rt_dump.ppm` in `FVR_SHOT_DIR` |
 | `FVR_GL_MT=0` | Disable Apple's multithreaded GL engine |
 | `FVR_KEYS` | Scripted key presses `ms:Key[:holdms],...`; the real keyboard and mouse are ignored while set. `9000:Return,12000:Return,15000:Return,18000:Return,21000:Return,24000:Return` drives the menus into a race |
 | `FVR_SHOT_DIR` + `FVR_SHOT_FRAMES` / `FVR_SHOT_SECS` | Dump the back buffer as PPM at given frame numbers or seconds; `FVR_SHOT_POST=1` also dumps the window after post-processing |

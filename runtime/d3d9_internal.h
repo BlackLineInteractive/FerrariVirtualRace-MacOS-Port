@@ -113,6 +113,9 @@ struct Shader : Obj {
     uint32_t uid = 0;           // unique for the process lifetime (program cache key)
     uint64_t hash = 0;          // of the bytecode (persistent shader-pair cache)
     bool uses_vp = false;       // VS reads the camera's ViewProjMtx (c16..c19)
+    // constant table (CTAB comment): name -> (first register, register count)
+    std::map<std::string, std::pair<int, int>> ctab;
+    int ctab_reg(const char *name) const { auto it = ctab.find(name); return it == ctab.end() ? -1 : it->second.first; }
     ~Shader();
     std::vector<uint32_t> code;
 };
