@@ -40,11 +40,30 @@ All settings are in the game's own *Video settings* menu.
 
 | Setting | What the port adds |
 | --- | --- |
-| **Antialias** | `FXAA` (post filter), `MSAA 2x / 4x / 8x` (real multisampling of the HDR scene, alpha-to-coverage for alpha-tested foliage), `FSR 1` (MSAA 4x + AMD FidelityFX Super Resolution 1 upscaling to the Retina pixel size and RCAS sharpening) |
+| **Antialias** | `FXAA` (post filter), `MSAA 2x / 4x / 8x` (real multisampling of the HDR scene, alpha-to-coverage for alpha-tested foliage), `FSR 1` (MSAA 4x + AMD FidelityFX Super Resolution 1 upscaling to the Retina pixel size and RCAS sharpening), `Temporal AA`, `Temporal 1.5x`, `Temporal 2x` (see below) |
 | **Resolution / Window size** | Every common size up to 2560x1440 (2K), 3840x2160 (4K) and the display's native Retina resolution. Sizes larger than the screen are scaled down to fit, which works as supersampling |
 | **Shadow detail** | Hardware shadow maps (depth-compare PCF) like the original Windows drivers |
 
 Changing video settings recreates the device in-game; the port keeps running.
+
+### Temporal AA and upscaling
+
+The `Temporal` entries work like AMD FSR 2 (it is the port's own implementation, not AMD's code): the camera is shifted by a sub-pixel amount every frame, every 3D draw also writes how far its pixels moved since the last frame, and the frames are accumulated into a full-resolution history with neighbourhood clipping, then sharpened with RCAS. The game's shaders don't produce motion vectors, so the port re-runs each vertex shader with the previous frame's matrices (matched draw by draw), which also covers the moving cars and wheels.
+
+- `Temporal AA` renders the 3D scene at full resolution: the smoothest image.
+- `Temporal 1.5x` / `Temporal 2x` render the 3D scene at 1/1.5 or 1/2 of the resolution and rebuild the full one from the history (temporal upscaling). The HUD and the game's post effects stay at full resolution.
+
+The game itself is usually limited by its ~12,000 draw calls per frame rather than by pixels, so upscaling frees the GPU but does not always raise the frame rate.
+
+### Screen-space reflections
+
+Optional, with the `Temporal` modes: the track surface reflects the cars, buildings and sky at grazing angles. The game has no material data, so it is applied to near-horizontal surfaces that are not grass. Enable it in `~/Library/Application Support/FerrariVirtualRace/options.txt`:
+
+```text
+ssr=0.8
+```
+
+The value is the strength (0 = off). Reflections cost about 4 ms with `Temporal 2x` at 4K and much more at native 4K, so use them with `Temporal 1.5x` or `Temporal 2x`.
 
 ## How It Works
 
@@ -95,13 +114,16 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 | Variable | Purpose |
 | --- | --- |
 | `FVR_GAME_DIR` | Game folder (skips auto-detection) |
-| `FVR_AA` | Force anti-aliasing: `off`, `fxaa`, `msaa2`, `msaa4`, `msaa8`, `fsr` |
-| `FVR_FPS=1` | Print FPS once a second and explain slow frames |
+| `FVR_AA` | Force anti-aliasing: `off`, `fxaa`, `msaa2`, `msaa4`, `msaa8`, `fsr`, `taa`, `taa15`, `taa2` |
+| `FVR_SSR` | Screen-space reflection strength (overrides `options.txt`); `FVR_SSR_DEBUG=1/2/3` shows normals / mask / ray hits |
+| `FVR_TAA_SCALE` | Override the render scale of the temporal modes (e.g. `0.75`) |
+| `FVR_FPS=1` | Print FPS every two seconds, explain slow frames, and log the GPU time of the scene, reflection and temporal passes |
+| `FVR_VSYNC=0` | Turn vertical sync off (benchmarks) |
 | `FVR_GL_MT=0` | Disable Apple's multithreaded GL engine |
 | `FVR_KEYS` | Scripted key presses `ms:Key[:holdms],...`; the real keyboard and mouse are ignored while set. `9000:Return,12000:Return,15000:Return,18000:Return,21000:Return,24000:Return` drives the menus into a race |
 | `FVR_SHOT_DIR` + `FVR_SHOT_FRAMES` / `FVR_SHOT_SECS` | Dump the back buffer as PPM at given frame numbers or seconds; `FVR_SHOT_POST=1` also dumps the window after post-processing |
 | `FVR_TRACE=1`, `FVR_D3D_TRACE=1` | Log Win32 / Direct3D calls (slow) |
-| `FVR_RT_LOG=N` | Log render-target switches during frame N |
+| `FVR_RT_LOG=N` | Log render-target switches during frame N (`sN`: the first frame after N seconds) |
 
 ## Testing & Utilities
 
@@ -116,7 +138,7 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md): more Ferrari models, higher track detail and new tracks, and what temporal upscalers (FSR 2/3) and screen-space reflections would need.
+See [docs/ROADMAP.md](docs/ROADMAP.md): fewer draw calls (the real frame-rate limit), a Metal backend, more Ferrari models, higher track detail and new tracks.
 
 ## Support & Links
 

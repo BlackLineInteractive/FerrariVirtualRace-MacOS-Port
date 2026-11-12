@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <array>
 
 // ====================================================================== locking / GL context
 static std::recursive_mutex g_d3d_mutex;
@@ -106,6 +107,8 @@ struct Program {
     float u_fix[2] = {-1, -1}, u_aref = -1, u_fog[4] = {-1, -1, -1, -1}, u_fogc[3] = {-1, -1, -1};
     int u_afunc = -1; bool u_vface = false;
     uint16_t shadow_mask = 0;      // PS samplers compiled as sampler2DShadow
+    bool vel = false;              // velocity variant (temporal AA scene pass): vcp / velOn uniforms
+    GLint vcp = -1, velOn = -1; float u_velon = -1;
     std::vector<GLint> vcl, pcl;   // location of every vc[i] / pc[i] (-1 if optimised away)
 };
 // What is currently bound in GL, to skip redundant calls (the macOS driver re-validates on each).
@@ -152,6 +155,19 @@ static struct Device {
     int cursor_shown = 0;
     uint16_t gamma[3][256];
     uint64_t frame = 0;
+    // temporal AA / upscaling: the scene render-target set is replaced by private targets at render
+    // resolution with a motion-vector attachment (see taa_bind)
+    bool taa_bound = false, taa_have = false, last_vel = false;
+    Surface *taa_rt = nullptr;       // game surface stood in for (identity only, not referenced)
+    int taa_lw = 0, taa_lh = 0; float taa_sx = 1, taa_sy = 1, taa_lod = 0;
+    GLuint taa_fbo = 0, taa_col = 0, taa_dep = 0, taa_vel = 0;
+    uint64_t taa_frame = ~0ull, taa_last = ~0ull;
+    float taa_jit[2] = {};
+    int vel_mask = -1;
+    std::unordered_map<uint64_t, std::array<float, 128>> vel_prev, vel_cur;   // draw -> c0..c31
+    std::unordered_map<uint64_t, int> vel_count;
+    float vp_cur[16] = {}, vp_prev[16] = {}, vel_R[16] = {};
+    bool vp_cur_ok = false, vp_prev_ok = false, vel_R_ok = false;
 } *D;
 
 static uint32_t g_vt[16];
@@ -850,10 +866,213 @@ static bool ms_eligible(int n) {
     }
     return true;
 }
+// ---------------------------------------------------------------- temporal AA / upscaling
+// In the temporal AA modes the scene render-target set (a standalone colour surface and a depth
+// surface, both back-buffer sized) is replaced by private targets at render resolution: colour,
+// depth and a motion-vector buffer. The camera is offset by a sub-pixel jitter every frame and
+// every scene draw writes its screen motion since the last frame: draws are matched with the same
+// draw of the previous frame and the shader is run again with that frame's matrices (c0..c31).
+// When the game copies the scene surface into its post-processing texture (StretchRect),
+// post_taa() accumulates the frames into that texture at full resolution.
+float post_temporal_scale();
+void post_taa_jitter(uint64_t frame, float scale, float *jx, float *jy);
+bool post_taa(GLuint col, GLuint dep, GLuint vel, int lw, int lh, GLuint dst, int ow, int oh, float jx, float jy, bool reset);
+
+static bool taa_eligible() {
+    if (!D->backbuf || !D->rt[0] || !D->ds || D->rt[1] || D->rt[2] || D->rt[3]) return false;
+    Surface *r = D->rt[0];
+    if (r == D->backbuf || r->container || is_depth_surf(r) || !r->gl_tex()) return false;
+    uint32_t w = D->backbuf->w, h = D->backbuf->h;
+    if (r->w != w || r->h != h || D->ds->w != w || D->ds->h != h) return false;
+    return post_temporal_scale() > 0;
+}
+static GLuint taa_tex(GLuint t, GLenum ifmt, GLenum fmt, GLenum type, int w, int h) {
+    if (!t) glGenTextures(1, &t);
+    scratch_bind(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    return t;
+}
+static void taa_timer(int point);
+static void taa_bind() {
+    float s = post_temporal_scale();
+    uint32_t w = D->backbuf->w, h = D->backbuf->h;
+    int lw = std::max(1, (int)lroundf(w * s)), lh = std::max(1, (int)lroundf(h * s));
+    if (!D->taa_fbo || lw != D->taa_lw || lh != D->taa_lh) {
+        D->taa_col = taa_tex(D->taa_col, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, lw, lh);
+        D->taa_vel = taa_tex(D->taa_vel, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, lw, lh);
+        D->taa_dep = taa_tex(D->taa_dep, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, lw, lh);
+        if (!D->taa_fbo) glGenFramebuffers(1, &D->taa_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, D->taa_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, D->taa_col, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, D->taa_vel, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, D->taa_dep, 0);
+        GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+        glDrawBuffers(2, bufs);
+        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        rtlog("d3d9: temporal AA targets %dx%d for %ux%u (fbo %s)", lw, lh, w, h, st == GL_FRAMEBUFFER_COMPLETE ? "ok" : "INCOMPLETE");
+        D->taa_lw = lw; D->taa_lh = lh;
+        D->taa_have = false;
+    } else glBindFramebuffer(GL_FRAMEBUFFER, D->taa_fbo);
+    D->taa_sx = (float)lw / w; D->taa_sy = (float)lh / h;
+    D->taa_lod = s < 0.99f ? log2f(s) : 0.0f;
+    if (D->taa_frame != D->frame) {   // first scene draw of this frame
+        D->taa_frame = D->frame;
+        taa_timer(0);
+        post_taa_jitter(D->frame, s, &D->taa_jit[0], &D->taa_jit[1]);
+    }
+    D->taa_rt = D->rt[0];
+    D->cur_fbo = D->taa_fbo;
+}
+// FVR_FPS: GPU time of the scene pass, the reflections and the temporal pass (timestamp queries).
+static void taa_timer(int point) {   // point 0: scene starts, 1: reflections, 2: temporal pass, 3: done
+    static int on = getenv("FVR_FPS") ? 1 : 0;
+    if (!on) return;
+    static GLuint q[2][3]; static bool init, pending[2], active;
+    static double sum[3]; static int n;
+    if (!init) { glGenQueries(6, &q[0][0]); init = true; }
+    int set = D->frame & 1;
+    if (point == 0 && pending[set]) {   // results of two frames ago
+        for (int i = 0; i < 3; i++) { GLuint64 t = 0; glGetQueryObjectui64v(q[set][i], GL_QUERY_RESULT, &t); sum[i] += t / 1e6; }
+        pending[set] = false;
+        if (++n == 120) { rtlog("gpu: scene %.2f ms, reflections %.2f ms, temporal %.2f ms", sum[0] / n, sum[1] / n, sum[2] / n); sum[0] = sum[1] = sum[2] = 0; n = 0; }
+    }
+    if (active) glEndQuery(GL_TIME_ELAPSED);
+    active = point < 3;
+    if (active) glBeginQuery(GL_TIME_ELAPSED, q[set][point]);
+    if (point == 3) pending[set] = true;
+}
+// Viewport / scissor coordinates on the bound target (render-resolution scaling while temporal).
+static int tsx(int v) { return D->taa_bound ? (int)lroundf(v * D->taa_sx) : v; }
+static int tsy(int v) { return D->taa_bound ? (int)lroundf(v * D->taa_sy) : v; }
+
+static void mat4_mul(const float *a, const float *b, float *r) {   // row-major r = a * b
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+        float v = 0; for (int k = 0; k < 4; k++) v += a[i * 4 + k] * b[k * 4 + j];
+        r[i * 4 + j] = v;
+    }
+}
+static bool mat4_inv(const float *m, float *o) {
+    float a[4][8];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 8; j++) a[i][j] = j < 4 ? m[i * 4 + j] : (j - 4 == i ? 1.0f : 0.0f);
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int r = c + 1; r < 4; r++) if (fabsf(a[r][c]) > fabsf(a[p][c])) p = r;
+        if (fabsf(a[p][c]) < 1e-12f) return false;
+        if (p != c) for (int j = 0; j < 8; j++) std::swap(a[p][j], a[c][j]);
+        float d = 1.0f / a[c][c];
+        for (int j = 0; j < 8; j++) a[c][j] *= d;
+        for (int r = 0; r < 4; r++) if (r != c) { float f = a[r][c]; for (int j = 0; j < 8; j++) a[r][j] -= f * a[c][j]; }
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) o[i * 4 + j] = a[i][j + 4];
+    return true;
+}
+// Previous-frame constants for this draw: the same draw last frame (matched by shader, buffers,
+// range and occurrence), else the current ones re-projected with last frame's camera (static).
+static void vel_setup(Program *p, uint64_t dkey) {
+    const float (*c)[4] = D->st.vsf;
+    if (D->st.vs->uses_vp && !D->vp_cur_ok) {
+        memcpy(D->vp_cur, c[16], 64);
+        D->vp_cur_ok = true;
+        float inv[16];
+        D->vel_R_ok = D->vp_prev_ok && mat4_inv(D->vp_cur, inv);
+        if (D->vel_R_ok) mat4_mul(D->vp_prev, inv, D->vel_R);
+    }
+    StreamSrc &s0 = D->st.streams[0];
+    uint64_t k = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { k ^= v; k *= 1099511628211ull; k ^= k >> 29; };
+    mix(D->st.vs->uid); mix(s0.vb ? s0.vb->buf : 0); mix(s0.offset); mix(dkey);
+    mix((uint64_t)D->vel_count[k]++);
+    auto &cur = D->vel_cur[k];
+    memcpy(cur.data(), c, sizeof(float) * 128);
+    for (auto &d : D->st.vs->sm.fdefs) if (d.first < SM_PREV_CONSTS) memcpy(&cur[d.first * 4], d.second.data(), 16);
+    float on = 0;
+    auto it = D->vel_prev.find(k);
+    if (it != D->vel_prev.end()) {
+        glUniform4fv(p->vcp, SM_PREV_CONSTS, it->second.data());
+        on = 1;
+    } else if (D->vel_R_ok) {
+        float t[SM_PREV_CONSTS * 4];
+        memcpy(t, cur.data(), sizeof t);
+        memcpy(t + 16 * 4, D->vp_prev, 64);   // ViewProjMtx
+        float w[16]; memcpy(w, &cur[20 * 4], 64);
+        mat4_mul(D->vel_R, w, t + 20 * 4);    // WorldViewProjMtx
+        glUniform4fv(p->vcp, SM_PREV_CONSTS, t);
+        on = 1;
+    }
+    if (on != p->u_velon) { glUniform1f(p->velOn, on); p->u_velon = on; }
+}
+// End of frame: this frame's draws become the previous ones.
+static void vel_frame_end() {
+    bool drawn = D->taa_frame == D->frame;
+    std::swap(D->vel_prev, D->vel_cur);
+    D->vel_cur.clear();
+    D->vel_count.clear();
+    if (!drawn) D->vel_prev.clear();
+    memcpy(D->vp_prev, D->vp_cur, 64);
+    D->vp_prev_ok = drawn && D->vp_cur_ok;
+    D->vp_cur_ok = D->vel_R_ok = false;
+}
+GLuint post_ssr(GLuint col, GLuint dep, int w, int h, const float *vp, const float *ivp, const float *cam, float strength, uint64_t frame);
+// Player options outside the game's menus: environment FVR_<NAME>, else "name=value" lines in
+// options.txt in the user folder.
+static float fvr_option(const char *name, float def) {
+    std::string env = "FVR_" + std::string(name);
+    for (char &ch : env) ch = (char)toupper((unsigned char)ch);
+    if (const char *e = getenv(env.c_str())) return (float)atof(e);
+    static std::map<std::string, float> opts; static bool loaded;
+    if (!loaded) {
+        loaded = true;
+        if (FILE *f = fopen((g_user_dir + "/options.txt").c_str(), "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, f)) {
+                char k[64]; float v;
+                if (line[0] != '#' && sscanf(line, " %63[^= ] = %f", k, &v) == 2) opts[k] = v;
+            }
+            fclose(f);
+        }
+    }
+    auto it = opts.find(name);
+    return it != opts.end() ? it->second : def;
+}
+static void taa_resolve(Surface *dst) {
+    bool reset = !D->taa_have || D->taa_last + 1 != D->frame;
+    GLuint col = D->taa_col;
+    taa_timer(1);
+    static float ssr = fvr_option("ssr", 0);
+    float ivp[16];
+    if (ssr > 0 && D->vp_cur_ok && mat4_inv(D->vp_cur, ivp)) {
+        // camera position: the point the projection maps to w = 0 at the image centre
+        float cam[3] = {ivp[2], ivp[6], ivp[10]};
+        float cw = ivp[14];
+        if (fabsf(cw) > 1e-12f) { cam[0] /= cw; cam[1] /= cw; cam[2] /= cw; }
+        col = post_ssr(D->taa_col, D->taa_dep, D->taa_lw, D->taa_lh, D->vp_cur, ivp, cam, ssr, D->frame);
+    }
+    taa_timer(2);
+    post_taa(col, D->taa_dep, D->taa_vel, D->taa_lw, D->taa_lh, dst->gl_tex(), dst->w, dst->h, D->taa_jit[0], D->taa_jit[1], reset);
+    taa_timer(3);
+    D->taa_have = true;
+    D->taa_last = D->frame;
+    glBindVertexArray(D->vao);
+    gl_cache_reset();
+    D->fbo_dirty = D->rs_dirty = D->vp_dirty = true;
+    D->vel_mask = -1;
+}
+
 // clear_flags: D3DCLEAR_* about to cover the whole target (skips copying stale texture contents in)
 static void bind_rt_fbo(uint32_t clear_flags = 0) {
     if (!D->fbo_dirty) return;
     if (D->ms_bound) { ms_flush(); D->ms_bound = false; }
+    bool was_taa = D->taa_bound;
+    D->taa_bound = taa_eligible();
+    if (D->taa_bound != was_taa) {
+        D->vp_dirty = D->rs_dirty = true;
+        D->vel_mask = -1;
+        for (int i = 0; i < 16; i++) D->samp_dirty[i] = true;   // texture LOD bias
+    }
+    if (D->taa_bound) { taa_bind(); D->fbo_dirty = false; return; }
     int n = post_msaa_samples();
     if (n > 0) {
         if (g_max_samples < 0) { glGetIntegerv(GL_MAX_SAMPLES, &g_max_samples); rtlog("d3d9: GL_MAX_SAMPLES %d", g_max_samples); }
@@ -933,7 +1152,7 @@ static float fl(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 
 static void apply_viewport() {
     Viewport &v = D->st.vp;
-    glViewport(v.x, v.y, v.w, v.h);
+    glViewport(tsx(v.x), tsy(v.y), tsx(v.x + v.w) - tsx(v.x), tsy(v.y + v.h) - tsy(v.y));
     glDepthRange(v.minz, v.maxz);
     D->vp_dirty = false;
 }
@@ -965,6 +1184,7 @@ static void apply_render_state() {
     uint32_t cw = rs[168];
     glColorMaski(0, cw & 1, (cw >> 1) & 1, (cw >> 2) & 1, (cw >> 3) & 1);
     for (int i = 1; i < 4; i++) { uint32_t m = rs[189 + i]; glColorMaski(i, m & 1, (m >> 1) & 1, (m >> 2) & 1, (m >> 3) & 1); }
+    D->vel_mask = -1;
     // stencil
     if (rs[52] && D->ds) {
         glEnable(GL_STENCIL_TEST);
@@ -980,7 +1200,7 @@ static void apply_render_state() {
     if (rs[174]) {
         glEnable(GL_SCISSOR_TEST);
         int *s = D->st.scissor;
-        glScissor(s[0], s[1], std::max(0, s[2] - s[0]), std::max(0, s[3] - s[1]));
+        glScissor(tsx(s[0]), tsy(s[1]), std::max(0, tsx(s[2]) - tsx(s[0])), std::max(0, tsy(s[3]) - tsy(s[1])));
     } else glDisable(GL_SCISSOR_TEST);
     // depth bias
     float bias = fl(rs[195]), slope = fl(rs[175]);
@@ -1014,7 +1234,7 @@ static void apply_sampler(int i) {
     glSamplerParameteri(sm, GL_TEXTURE_MIN_FILTER, mf);
     float aniso = (min == 3 || mag == 3) ? (float)std::max<uint32_t>(1, std::min<uint32_t>(16, s[10])) : 1.0f;
     glSamplerParameterf(sm, GL_TEXTURE_MAX_ANISOTROPY_EXT, aniso);
-    glSamplerParameterf(sm, GL_TEXTURE_LOD_BIAS, fl(s[8]));
+    glSamplerParameterf(sm, GL_TEXTURE_LOD_BIAS, fl(s[8]) + (D->taa_bound && i < 16 ? D->taa_lod : 0.0f));
     glSamplerParameterf(sm, GL_TEXTURE_MIN_LOD, (float)s[9]);
     D->samp_dirty[i] = false;
 }
@@ -1033,7 +1253,7 @@ static GLuint compile_shader(GLenum type, const std::string &src) {
     return sh;
 }
 
-static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask = 0);
+static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask = 0, bool vel = false);
 
 // ---- persistent list of (VS, PS) pairs the game has drawn with, so they can be linked while
 // the game is loading instead of stalling the first frame that uses them.
@@ -1057,7 +1277,9 @@ static void pairs_load() {
         rtlog("d3d9: %zu known shader pairs", g_pairs.size());
     }
 }
-static uint64_t prog_key(Shader *vs, Shader *ps, uint16_t mask) { return ((uint64_t)vs->uid << 40) | ((uint64_t)ps->uid << 16) | mask; }
+static uint64_t prog_key(Shader *vs, Shader *ps, uint16_t mask, bool vel = false) {
+    return ((uint64_t)vs->uid << 40) | ((uint64_t)ps->uid << 16) | mask | (vel ? 1ull << 63 : 0);
+}
 // PS 2D samplers whose bound texture is a shadow-map depth texture.
 static uint16_t shadow_mask(Shader *ps) {
     uint16_t m = 0;
@@ -1074,6 +1296,7 @@ static Program *program_for_pair(Shader *vs, Shader *ps) {
     if (it != D->sm_progs.end()) return it->second;
     Program *p = get_program_slow(nullptr, vs, ps);
     D->sm_progs[k] = p;
+    if (post_temporal_scale() > 0 && ps->sm.color_outputs == 1) D->sm_progs[prog_key(vs, ps, 0, true)] = get_program_slow(nullptr, vs, ps, 0, true);
     return p;
 }
 // A new shader exists: link it with every remembered partner that is alive.
@@ -1100,12 +1323,14 @@ static Program *get_program(Decl *decl) {
     Shader *ps = st.ps && st.ps->ok ? st.ps : nullptr;
     if (!vs || !ps) return get_program_slow(decl, vs, ps, ps ? shadow_mask(ps) : 0);   // fixed-function parts depend on render state
     uint16_t mask = shadow_mask(ps);
-    if (D->last_prog && D->last_vs == vs->uid && D->last_ps == ps->uid && D->last_mask == mask) return D->last_prog;
-    uint64_t k = prog_key(vs, ps, mask);
+    static bool novel = getenv("FVR_TAA_NOVEL") != nullptr;   // benchmark: temporal targets without motion vectors
+    bool vel = D->taa_bound && ps->sm.color_outputs == 1 && !novel;
+    if (D->last_prog && D->last_vs == vs->uid && D->last_ps == ps->uid && D->last_mask == mask && D->last_vel == vel) return D->last_prog;
+    uint64_t k = prog_key(vs, ps, mask, vel);
     auto it = D->sm_progs.find(k);
     Program *p = it != D->sm_progs.end() ? it->second : nullptr;
     if (!p) {
-        p = get_program_slow(decl, vs, ps, mask);
+        p = get_program_slow(decl, vs, ps, mask, vel);
         D->sm_progs[k] = p;
         pairs_load();
         if (!g_pairs.count({vs->hash, ps->hash})) {
@@ -1113,12 +1338,13 @@ static Program *get_program(Decl *decl) {
             if (FILE *f = fopen(pairs_path().c_str(), "a")) { fprintf(f, "%016llx %016llx\n", (unsigned long long)vs->hash, (unsigned long long)ps->hash); fclose(f); }
         }
     }
-    D->last_prog = p; D->last_vs = vs->uid; D->last_ps = ps->uid; D->last_mask = mask;
+    D->last_prog = p; D->last_vs = vs->uid; D->last_ps = ps->uid; D->last_mask = mask; D->last_vel = vel;
     return p;
 }
-static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask) {
+static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask, bool vel) {
     DevState &st = D->st;
-    std::string key = std::to_string(vs ? vs->uid : 0) + "/" + std::to_string(ps ? ps->uid : 0) + "#" + std::to_string(mask);
+    vel = vel && vs && ps;
+    std::string key = std::to_string(vs ? vs->uid : 0) + "/" + std::to_string(ps ? ps->uid : 0) + "#" + std::to_string(mask) + (vel ? "v" : "");
     std::string vsrc, psrc, k1, k2;
     SmShader ffps_if, ffvs_if;
     if (!vs) {
@@ -1132,10 +1358,10 @@ static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t ma
     }
     auto it = D->progs.find(key);
     if (it != D->progs.end()) return &it->second;
-    if (vs) { ffps_if = ff_ps_iface(); vsrc = sm_vs_source(vs->sm, ps ? &ps->sm : &ffps_if); }
-    if (ps) { ffvs_if = ff_vs_iface(decl, st); psrc = sm_ps_source(ps->sm, vs ? &vs->sm : &ffvs_if, mask); }
+    if (vs) { ffps_if = ff_ps_iface(); vsrc = sm_vs_source(vs->sm, ps ? &ps->sm : &ffps_if, vel); }
+    if (ps) { ffvs_if = ff_vs_iface(decl, st); psrc = sm_ps_source(ps->sm, vs ? &vs->sm : &ffvs_if, mask, vel); }
     Program &p = D->progs[key];
-    p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps; p.shadow_mask = mask;
+    p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps; p.shadow_mask = mask; p.vel = vel;
     GLuint a = compile_shader(GL_VERTEX_SHADER, vsrc), b = compile_shader(GL_FRAGMENT_SHADER, psrc);
     p.prog = glCreateProgram();
     D->links++;
@@ -1152,6 +1378,7 @@ static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t ma
     p.vc = U("vc"); p.vi = U("vi"); p.vb = U("vb"); p.pc = U("pc"); p.pi = U("pi"); p.pb = U("pb");
     p.posFixup = U("posFixup"); p.alphaFunc = U("alphaFunc"); p.alphaRef = U("alphaRef"); p.vfaceSign = U("vfaceSign");
     p.fogColor = U("fogColor"); p.fogParams = U("fogParams");
+    p.vcp = U("vcp"); p.velOn = U("velOn");
     char nm[16];
     if (p.vc >= 0) { p.vcl.resize(256); for (int i = 0; i < 256; i++) { snprintf(nm, sizeof nm, "vc[%d]", i); p.vcl[i] = U(nm); } }
     if (p.pc >= 0) { p.pcl.resize(224); for (int i = 0; i < 224; i++) { snprintf(nm, sizeof nm, "pc[%d]", i); p.pcl[i] = U(nm); } }
@@ -1220,6 +1447,10 @@ static void upload_consts(Program *p) {
     Viewport &v = st.vp;
     if (p->posFixup >= 0) {
         float fx = v.w ? 1.0f / v.w : 0, fy = v.h ? 1.0f / v.h : 0;
+        if (D->taa_bound) {   // render-resolution half pixel plus this frame's jitter (in render pixels)
+            float pw = std::max(1, tsx(v.x + v.w) - tsx(v.x)), ph = std::max(1, tsy(v.y + v.h) - tsy(v.y));
+            fx = (1.0f + 2.0f * D->taa_jit[0]) / pw; fy = (1.0f + 2.0f * D->taa_jit[1]) / ph;
+        }
         if (fx != p->u_fix[0] || fy != p->u_fix[1]) { glUniform4f(p->posFixup, fx, fy, 0, 0); p->u_fix[0] = fx; p->u_fix[1] = fy; }
     }
     uint32_t *rs = st.rs;
@@ -1453,7 +1684,8 @@ static GLenum prim_mode(uint32_t t, uint32_t n, uint32_t *count) {
     }
 }
 
-static Program *prepare_draw() {
+// dkey: identifies the draw's geometry range (motion-vector matching across frames)
+static Program *prepare_draw(uint64_t dkey = 0) {
     D->draws++;
     bind_rt_fbo();
     if (D->vp_dirty) apply_viewport();
@@ -1462,6 +1694,12 @@ static Program *prepare_draw() {
     Program *p = get_program(decl);
     use_program(p->prog);
     upload_consts(p);
+    if (D->taa_bound) {
+        // motion vectors for opaque draws; blended ones keep what is behind them
+        int want = p->vel && !D->st.rs[27];
+        if (want != D->vel_mask) { glColorMaski(1, want, want, want, want); D->vel_mask = want; }
+        if (p->vel) vel_setup(p, dkey);
+    }
     bind_textures(p);
     if (D->rt[0] && D->rt[0]->container) D->rt[0]->container->rendered = true;   // mips need regeneration
     return p;
@@ -1500,8 +1738,10 @@ static void set_decl(Decl *d) {
     Decl *o = D->st.decl; D->st.decl = d;
     if (o) obj_release(o);
 }
-static bool rtlog_frame() {   // FVR_RT_LOG=N: log render-target traffic during frame N
-    static long f = getenv("FVR_RT_LOG") ? atol(getenv("FVR_RT_LOG")) : -1;
+static bool rtlog_frame() {   // FVR_RT_LOG=N: log render-target traffic during frame N (sN: first frame after N seconds)
+    static const char *e = getenv("FVR_RT_LOG");
+    static long f = e && *e != 's' ? atol(e) : -1;
+    if (e && *e == 's' && f < 0 && SDL_GetTicks() / 1000.0 >= atof(e + 1)) f = (long)D->frame + 1;
     return f >= 0 && (long)D->frame == f;
 }
 static void set_rt(int i, Surface *s) {
@@ -1613,7 +1853,8 @@ static void apply_window_mode() {
     SDL_ShowWindow(g_win);
     SDL_SyncWindow(g_win);
     uint32_t iv = D->pp[13];
-    SDL_GL_SetSwapInterval(iv == 0x80000000u ? 0 : 1);
+    const char *vs = getenv("FVR_VSYNC");   // 0: off (benchmarks), 1: on; default: what the game asks for
+    SDL_GL_SetSwapInterval(vs ? (atoi(vs) ? 1 : 0) : iv == 0x80000000u ? 0 : 1);
 }
 
 static void debug_shot() {
@@ -1716,6 +1957,7 @@ static void present() {
     D->fbo_dirty = true;
     D->rs_dirty = true;
     D->vp_dirty = true;
+    vel_frame_end();
     D->frame++;
     if (trace() && D->frame % 300 == 0) rtlog("d3d9: frame %llu", (unsigned long long)D->frame);
 }
@@ -1918,6 +2160,13 @@ M(dev_StretchRect) {
     const FmtInfo *fs = fmt_info(src->fmt);
     bool depth = fs && fs->depth;
     if (rtlog_frame()) rtlog("StretchRect tex %u %ux%u -> tex %u %ux%u (%d,%d,%d,%d)->(%d,%d,%d,%d) draws %u", src->gl_tex(), src->w, src->h, dst->gl_tex(), dst->w, dst->h, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, (unsigned)D->draws);
+    if (src == D->taa_rt && D->taa_frame == D->frame && !depth && dst->gl_tex() && dst != D->backbuf) {
+        // the scene was drawn into the temporal targets: accumulate into the destination
+        ms_touch(dst);
+        taa_resolve(dst);
+        if (dst->container && dst->container->autogen && dst->level == 0) { scratch_bind(dst->container->target, dst->container->tex); glGenerateMipmap(dst->container->target); }
+        RETN(6, D3D_OK);
+    }
     ms_flush();
     ms_touch(dst);
     if (!src->gl_tex() && src->mem) {   // sysmem -> GL surface
@@ -2011,12 +2260,13 @@ M(dev_Clear) {
                 uint32_t r = rects + 16 * i;
                 int a = std::max(x0, (int)R32(r)), b = std::max(y0, (int)R32(r + 4)), cc = std::min(x1, (int)R32(r + 8)), d = std::min(y1, (int)R32(r + 12));
                 if (cc <= a || d <= b) continue;
-                glScissor(a, b, cc - a, d - b);
+                glScissor(tsx(a), tsy(b), tsx(cc) - tsx(a), tsy(d) - tsy(b));
                 glClear(mask);
             }
         } else if (x1 > x0 && y1 > y0) {
-            glScissor(x0, y0, x1 - x0, y1 - y0);
+            glScissor(tsx(x0), tsy(y0), tsx(x1) - tsx(x0), tsy(y1) - tsy(y0));
             glClear(mask);
+            if (D->taa_bound && (flags & 1)) { static const float unk[4] = {0, 0, 1, 0}; glClearBufferfv(GL_COLOR, 1, unk); }
         }
     }
     D->rs_dirty = true;
@@ -2158,7 +2408,7 @@ M(dev_DrawPrimitive) {
     GUARD;
     uint32_t count; GLenum mode = prim_mode(ARG(1), ARG(3), &count);
     if (!count) RETN(4, D3D_OK);
-    Program *p = prepare_draw();
+    Program *p = prepare_draw(((uint64_t)ARG(1) << 56) ^ ((uint64_t)ARG(2) << 24) ^ count);
     int inst = setup_attribs(current_decl(), p, 0, 0, 0);
     if (inst > 1) glDrawArraysInstanced(mode, ARG(2), count, inst);
     else glDrawArrays(mode, ARG(2), count);
@@ -2169,7 +2419,7 @@ M(dev_DrawIndexedPrimitive) {
     uint32_t count; GLenum mode = prim_mode(ARG(1), ARG(6), &count);
     Buffer *ib = D->st.ib;
     if (!count || !ib) RETN(7, D3D_OK);
-    Program *p = prepare_draw();
+    Program *p = prepare_draw(((uint64_t)ib->buf << 40) ^ ((uint64_t)ARG(2) << 32) ^ ((uint64_t)ARG(5) << 16) ^ count);
     int base = (int)ARG(2);
     int inst = setup_attribs(current_decl(), p, 0, 0, 0);
     if (D->cur_ebo != ib->buf) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->buf); D->cur_ebo = ib->buf; }
@@ -2187,7 +2437,7 @@ M(dev_DrawPrimitiveUP) {
     if (!count) RETN(5, D3D_OK);
     set_stream(0, nullptr, 0, 0);
     D->up_draws++;
-    Program *p = prepare_draw();
+    Program *p = prepare_draw(0x5550000000000000ull ^ count);
     glBindBuffer(GL_ARRAY_BUFFER, D->up_vbo);
     glBufferData(GL_ARRAY_BUFFER, count * stride, H(ARG(3)), GL_STREAM_DRAW);
     setup_attribs(current_decl(), p, D->up_vbo, stride, 0);
@@ -2203,7 +2453,7 @@ M(dev_DrawIndexedPrimitiveUP) {
     set_stream(0, nullptr, 0, 0);
     set_indices(nullptr);
     bool i32 = ARG(6) == 102;
-    Program *p = prepare_draw();
+    Program *p = prepare_draw(0x5551000000000000ull ^ ((uint64_t)nv << 24) ^ count);
     glBindBuffer(GL_ARRAY_BUFFER, D->up_vbo);
     glBufferData(GL_ARRAY_BUFFER, (minv + nv) * stride, H(ARG(7)), GL_STREAM_DRAW);
     setup_attribs(current_decl(), p, D->up_vbo, stride, 0);
@@ -2247,6 +2497,12 @@ static Shader *make_shader(Kind k, uint32_t code) {
     for (uint32_t w : s->code) { h ^= w; h *= 1099511628211ull; }
     s->hash = h ^ (k == K_PS ? 0x9e3779b97f4a7c15ull : 0);
     s->ok = sm_translate(s->code.data(), s->code.size(), s->sm);
+    if (k == K_VS) {   // constant table names this game's camera matrix "ViewProjMtx" (c16)
+        const char *b = (const char *)s->code.data(), *e = b + s->code.size() * 4;
+        static const char kName[] = "ViewProjMtx";
+        for (const char *q = b; (q = (const char *)memmem(q, e - q, kName, sizeof kName)) != nullptr; q++)
+            if (q == b || !isalpha((unsigned char)q[-1])) { s->uses_vp = true; break; }
+    }
     if (!s->ok) rtlog("d3d9: shader translation failed (%s): %s", k == K_VS ? "vs" : "ps", s->sm.error.c_str());
     pairs_warm(s);
     return s;
@@ -2388,10 +2644,11 @@ M(d3d_CheckDeviceFormat) {
 }
 bool post_aa_type_supported(uint32_t t);
 M(d3d_CheckDeviceMultiSampleType) {
-    // Types 2 and 3 are offered to the game's AA menu and mapped to FXAA / FSR post-processing
-    // (d3d9_post.cpp); surfaces created with them are not really multisampled.
+    // The game's AA menu lists the types reported here; d3d9_post.cpp maps them to FXAA, MSAA,
+    // FSR 1 and the temporal modes. Surfaces created with them are not multisampled themselves.
     uint32_t ms = ARG(5);
     bool ok = post_aa_type_supported(ms);
+    if (trace() || getenv("FVR_AA_LOG")) rtlog("d3d9: CheckDeviceMultiSampleType(fmt %x, type %u) -> %s", ARG(3), ms, ok ? "yes" : "no");
     if (ARG(6)) W32(ARG(6), ok ? 1 : 0);
     RETN(7, ok ? D3D_OK : D3DERR_NOTAVAILABLE);
 }

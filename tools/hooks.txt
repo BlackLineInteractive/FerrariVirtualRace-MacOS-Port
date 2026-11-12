@@ -1,0 +1,2 @@
+# Host hooks: replace one guest instruction with a call into the runtime ("address function" per line)
+0050238b fvr_hook_aa_label

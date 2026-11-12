@@ -35,9 +35,13 @@ bool sm_translate(const uint32_t *tokens, size_t max_tokens, SmShader &out);
 size_t sm_length(const uint32_t *tokens, size_t max_tokens);
 
 // Final GLSL sources for a VS/PS pair (varyings are matched by usage/index).
-std::string sm_vs_source(const SmShader &vs, const SmShader *ps);
+// vel: also output the previous frame's clip position (mvC / mvP), re-running the body with the
+// first SM_PREV_CONSTS float constants taken from `vcp` (see d3d9.cpp, temporal AA).
+static const int SM_PREV_CONSTS = 32;
+std::string sm_vs_source(const SmShader &vs, const SmShader *ps, bool vel = false);
 // shadow_mask: 2D samplers bound to depth textures (sampled as depth comparisons).
-std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow_mask = 0);
+// vel: write the motion vector from mvC / mvP to colour output 1.
+std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow_mask = 0, bool vel = false);
 
 // Name of the varying that carries a semantic.
 std::string sm_varying(int usage, int index);

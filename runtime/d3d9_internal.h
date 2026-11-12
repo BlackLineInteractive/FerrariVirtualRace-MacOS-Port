@@ -112,6 +112,7 @@ struct Shader : Obj {
     bool ok = false;
     uint32_t uid = 0;           // unique for the process lifetime (program cache key)
     uint64_t hash = 0;          // of the bytecode (persistent shader-pair cache)
+    bool uses_vp = false;       // VS reads the camera's ViewProjMtx (c16..c19)
     ~Shader();
     std::vector<uint32_t> code;
 };

@@ -54,6 +54,13 @@ int main(int argc, char **argv) {
             printf("%06zx %s_%d_%d: GL FAIL\n%s\n", off, s.ps ? "ps" : "vs", s.major, s.minor, log.c_str());
             if (verbose) printf("%s\n", src.c_str());
         } else if (verbose) printf("%06zx ok\n", off);
+        // temporal AA velocity variant
+        std::string vsrc = s.ps ? sm_ps_source(s, nullptr, 0, true) : sm_vs_source(s, nullptr, true);
+        if (!compile(s.ps ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, vsrc, log)) {
+            gl_fail++;
+            printf("%06zx %s_%d_%d (velocity): GL FAIL\n%s\n", off, s.ps ? "ps" : "vs", s.major, s.minor, log.c_str());
+            if (verbose) printf("%s\n", vsrc.c_str());
+        }
         off += (len - 1) * 4;
     }
     printf("total %d, translate failures %d, GL failures %d\n", total, tr_fail, gl_fail);

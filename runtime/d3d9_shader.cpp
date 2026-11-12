@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <cctype>
 
 namespace {
 
@@ -613,10 +614,30 @@ bool sm_translate(const uint32_t *tokens, size_t max_tokens, SmShader &out) {
 
 static std::string comps(int n) { return std::string("xyzw").substr(0, n); }
 
-std::string sm_vs_source(const SmShader &vs, const SmShader *ps) {
+// Constants c0..c31 hold the per-object and camera matrices in this game's shaders (WorldMtx c0,
+// ViewProjMtx c16, WorldViewProjMtx c20, ...). The velocity variant runs the shader body a second
+// time with last frame's values of those registers (vcp) to get the previous clip position.
+static std::string prev_consts(const std::string &code) {
+    std::string r;
+    r.reserve(code.size());
+    for (size_t i = 0; i < code.size();) {
+        if (code.compare(i, 3, "vc[") == 0 && (i == 0 || !isalnum((unsigned char)code[i - 1])) && isdigit((unsigned char)code[i + 3])) {
+            size_t j = i + 3; int n = 0;
+            while (j < code.size() && isdigit((unsigned char)code[j])) n = n * 10 + (code[j++] - '0');
+            if (j < code.size() && code[j] == ']' && n < SM_PREV_CONSTS) { r += "vcp[" + std::to_string(n) + "]"; i = j + 1; continue; }
+        }
+        r += code[i++];
+    }
+    return r;
+}
+
+std::string sm_vs_source(const SmShader &vs, const SmShader *ps, bool vel) {
     std::string s = "#version 410 core\n";
     s += PRELUDE;
     s += "uniform vec4 vc[256];\nuniform ivec4 vi[16];\nuniform bool vb[16];\nuniform vec4 posFixup;\n";
+    // a body that calls subroutines reading the matrices cannot be re-run with other constants
+    bool rerun = vel && vs.funcs.find("vc[") == std::string::npos;
+    if (vel) s += fmt("uniform vec4 vcp[%d];\nuniform float velOn;\nout vec4 mvC;\nout vec4 mvP;\n", SM_PREV_CONSTS);
     for (int i = 0; i < 4; i++)
         if (vs.samplers_used & (1 << i)) s += fmt("uniform %s vs_s%d;\n", sampler_glsl(vs.sampler_type[i]), i);
     for (auto &in : vs.inputs) s += fmt("layout(location = %s) in vec4 %s;\n", in.reg.c_str() + 1, in.reg.c_str());
@@ -664,6 +685,12 @@ std::string sm_vs_source(const SmShader &vs, const SmShader *ps) {
         pos = vs.pos_reg.empty() ? "vec4(0.0, 0.0, 0.0, 1.0)" : vs.pos_reg;
         if (vs.writes_psize) s += "    gl_PointSize = " + vs.psize_reg + ";\n";
     }
+    if (vel) {
+        s += "    vec4 tvC = " + pos + ", tvP = vec4(0.0);\n";
+        if (rerun) s += "    if (velOn > 0.5) {\n" + prev_consts(vs.body) + "        tvP = " + pos + ";\n    }\n";
+        s += "    mvC = tvC; mvP = tvP;\n";
+        pos = "tvC";
+    }
     s += "    gl_Position = " + pos + ";\n";
     s += "    gl_Position.y = -gl_Position.y;\n";
     s += "    gl_Position.xy += posFixup.xy * gl_Position.w;\n";
@@ -673,7 +700,7 @@ std::string sm_vs_source(const SmShader &vs, const SmShader *ps) {
     return s;
 }
 
-std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow_mask) {
+std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow_mask, bool vel) {
     (void)vs;
     std::string s = "#version 410 core\n";
     s += PRELUDE;
@@ -707,6 +734,8 @@ std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow
     bool fog_in = ps.major < 3 && !declared.count(sm_varying(11, 0));
     if (fog_in) s += "in vec4 " + sm_varying(11, 0) + ";\n";
     for (int i = 0; i < ps.color_outputs; i++) s += fmt("layout(location = %d) out vec4 oC%d;\n", i, i);
+    // velocity variant: screen motion since last frame in texture coordinates (z = 1: unknown)
+    if (vel) s += "in vec4 mvC;\nin vec4 mvP;\nlayout(location = 1) out vec4 oVel;\n";
     s += ps.decls;
     s += ps.funcs;
     s += "bool atest(float a) {\n"
@@ -745,6 +774,8 @@ std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow
     s += "        gl_SampleMask[0] = ((m << r) | (m >> (N - r))) & full;\n";
     s += "    } else if (!atest(oC0.a)) discard;\n";
     if (ps.writes_depth) s += "    gl_FragDepth = clamp(o_depth.x, 0.0, 1.0);\n";
+    if (vel) s += "    oVel = mvP.w > 1e-6 && mvC.w > 1e-6 ? vec4((mvC.xy / mvC.w - mvP.xy / mvP.w) * vec2(0.5, -0.5), 0.0, 1.0)\n"
+                  "                                     : vec4(0.0, 0.0, 1.0, 1.0);\n";
     s += "}\n";
     return s;
 }

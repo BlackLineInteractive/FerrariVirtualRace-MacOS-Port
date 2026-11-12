@@ -1,26 +1,35 @@
 // Anti-aliasing modes offered in the game's "Anti Aliasing" option.
 //
 // The game lists the D3D multisample types the device reports (index == type, see the table at
-// 0x67a980 in FerrariVR_Hi.exe) and stores the chosen index in a global. We report types 2..6:
+// 0x67a980 in FerrariVR_Hi.exe) and stores the chosen index in a global. We report types 2..9:
 //   2 -> FXAA       post pass (FXAA 3.11 style, quality preset ~12)
 //   3 -> MSAA 2x    real multisampling of the scene (d3d9.cpp, "MSAA shadows")
 //   4 -> MSAA 4x
 //   5 -> MSAA 8x
 //   6 -> FSR 1      MSAA 4x, then AMD FidelityFX Super Resolution 1: EASU upscale to the window's
 //                   native pixel size and RCAS sharpening
+//   7 -> Temporal AA       temporal accumulation in the style of FSR 2 at native resolution: the
+//   8 -> Temporal 1.5x     camera is jittered every frame, the scene pass writes per-object motion
+//   9 -> Temporal 2x       vectors (d3d9.cpp) and post_taa() accumulates the jittered frames into a
+//                          history buffer. 8 / 9 render the 3D scene at 1/1.5 and 1/2 of the
+//                          resolution and reconstruct the full one (temporal upscaling); the HUD and
+//                          post effects stay at full resolution. RCAS sharpening at the end.
 #define GL_SILENCE_DEPRECATION
 #include "rt.h"
 #include <OpenGL/gl3.h>
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 
 // Guest global holding the clamped "AntiAlias" index (FerrariVR_Hi.exe).
 static const uint32_t kGuestAntiAlias = 0x9cf280;
 
-struct AaMode { int post, samples; const char *label; };   // post: 0 none, 1 FXAA, 2 FSR 1
+// post: 0 none, 1 FXAA, 2 FSR 1, 3 temporal (sharpen); scale: temporal render scale (0: not temporal)
+struct AaMode { int post, samples; const char *label; float scale; };
 static const AaMode kModes[] = {
-    {0, 0, nullptr}, {0, 0, nullptr}, {1, 0, "FXAA"}, {0, 2, "MSAA 2x"}, {0, 4, "MSAA 4x"}, {0, 8, "MSAA 8x"}, {2, 4, "FSR 1"},
+    {0, 0, nullptr, 0}, {0, 0, nullptr, 0}, {1, 0, "FXAA", 0}, {0, 2, "MSAA 2x", 0}, {0, 4, "MSAA 4x", 0}, {0, 8, "MSAA 8x", 0},
+    {2, 4, "FSR 1", 0}, {3, 0, "Temporal AA", 1.0f}, {3, 0, "Temporal 1.5x", 1.0f / 1.5f}, {3, 0, "Temporal 2x", 0.5f},
 };
 static const int kNumModes = sizeof kModes / sizeof kModes[0];
 
@@ -31,7 +40,7 @@ static const AaMode &aa_mode() {
         forced = -1;
         if (e) {
             forced = 0;
-            static const char *names[] = {"off", "", "fxaa", "msaa2", "msaa4", "msaa8", "fsr"};
+            static const char *names[] = {"off", "", "fxaa", "msaa2", "msaa4", "msaa8", "fsr", "taa", "taa15", "taa2"};
             for (int i = 0; i < kNumModes; i++) if (!strcmp(e, names[i])) forced = i;
         }
     }
@@ -40,6 +49,12 @@ static const AaMode &aa_mode() {
 }
 int post_aa_mode() { return aa_mode().post; }
 int post_msaa_samples() { return aa_mode().samples; }
+float post_temporal_scale() {
+    static float forced = -1;
+    if (forced < 0) { const char *e = getenv("FVR_TAA_SCALE"); forced = e ? (float)atof(e) : 0; }   // debug override
+    float s = aa_mode().scale;
+    return s > 0 && forced > 0 ? forced : s;
+}
 bool post_aa_type_supported(uint32_t t) { return t == 0 || (t < (uint32_t)kNumModes && kModes[t].label); }
 
 // Options menu: the game formats each entry as "%dx" from the multisample type.
@@ -390,4 +405,302 @@ void post_fill_ms(GLuint color, GLuint depth, int w, int h) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Temporal accumulation / upscaling (FSR 2 style). Inputs at render resolution: HDR colour, depth
+// and motion vectors (texture-space offset since last frame, z = 1 where unknown); the camera was
+// offset by `jit` pixels this frame. The history lives at output resolution in a tone-mapped space
+// with the accumulated sample weight in alpha.
+static const char *kTaaFS = R"(#version 410 core
+uniform sampler2D col, dep, vel, hist;
+uniform vec2 lowSize, outSize, jit;
+uniform float maxW;
+uniform int reset, dbg;
+layout(location = 0) out vec4 oHist;
+layout(location = 1) out vec4 oDst;
+vec3 tm(vec3 c) { return c / (1.0 + max(max(c.r, c.g), c.b)); }
+vec3 itm(vec3 c) { return c / max(1.0 - max(max(c.r, c.g), c.b), 1e-4); }
+vec3 ycc(vec3 c) { return vec3(dot(c, vec3(0.25, 0.5, 0.25)), dot(c, vec3(0.5, 0.0, -0.5)), dot(c, vec3(-0.25, 0.5, -0.25))); }
+vec3 rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+vec4 H(vec2 uv) { return textureLod(hist, uv, 0.0); }
+// Catmull-Rom history sample from 5 bilinear taps
+vec4 histCR(vec2 uv) {
+    vec2 p = uv * outSize, t1 = floor(p - 0.5) + 0.5, f = p - t1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2, t0 = (t1 - 1.0) / outSize, t3 = (t1 + 2.0) / outSize, t12 = (t1 + w2 / w12) / outSize;
+    vec4 r = H(vec2(t12.x, t0.y)) * (w12.x * w0.y) + H(vec2(t0.x, t12.y)) * (w0.x * w12.y) + H(t12) * (w12.x * w12.y)
+           + H(vec2(t3.x, t12.y)) * (w3.x * w12.y) + H(vec2(t12.x, t3.y)) * (w12.x * w3.y);
+    float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / ws, vec4(0.0));
+}
+// one neighbourhood sample: reconstruction weight by its distance (output pixels), colour moments,
+// nearest depth for the motion vector
+void tap(ivec2 i0, ivec2 o, vec2 lp, vec2 ratio, ivec2 mx, inout vec3 sum, inout float sw, inout vec3 m1, inout vec3 m2,
+         inout float zmin, inout ivec2 best, inout float alpha) {
+    ivec2 q = clamp(i0 + o, ivec2(0), mx);
+    vec4 cs = texelFetch(col, q, 0);
+    vec3 c = tm(max(cs.rgb, vec3(0.0)));
+    vec2 d = (vec2(i0 + o) + 0.5 - jit - lp) * ratio;
+    float x = clamp(1.0 - 0.4 * dot(d, d), 0.0, 1.0);   // ~exp(-2.3 d^2) near the centre
+    float w = x * x;
+    sum += c * w; sw += w;
+    vec3 yc = ycc(c); m1 += yc; m2 += yc * yc;
+    if (o == ivec2(0)) alpha = cs.a;
+    float z = texelFetch(dep, q, 0).r;
+    if (z < zmin) { zmin = z; best = q; }
+}
+void main() {
+    vec2 uv = gl_FragCoord.xy / outSize;
+    vec2 lp = uv * lowSize;                 // output pixel centre in render pixels
+    vec2 ratio = outSize / lowSize;         // output pixels per render pixel
+    ivec2 i0 = ivec2(floor(lp + jit)), mx = ivec2(lowSize) - 1;
+    vec3 sum = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0);
+    float sw = 0.0, zmin = 2.0, alpha = 1.0;
+    ivec2 best = clamp(i0, ivec2(0), mx);
+    tap(i0, ivec2(0, 0), lp, ratio, mx, sum, sw, m1, m2, zmin, best, alpha);
+    tap(i0, ivec2(-1, 0), lp, ratio, mx, sum, sw, m1, m2, zmin, best, alpha);
+    tap(i0, ivec2(1, 0), lp, ratio, mx, sum, sw, m1, m2, zmin, best, alpha);
+    tap(i0, ivec2(0, -1), lp, ratio, mx, sum, sw, m1, m2, zmin, best, alpha);
+    tap(i0, ivec2(0, 1), lp, ratio, mx, sum, sw, m1, m2, zmin, best, alpha);
+    vec3 cur = sum / max(sw, 1e-6);
+    vec3 res = cur;
+    float w = min(sw, 1.0);
+    vec4 v = texelFetch(vel, best, 0);      // motion of the nearest surface around this pixel
+    vec2 huv = uv - v.xy;
+    if (dbg == 2) { oHist = vec4(cur, 1.0); oDst = vec4(itm(cur), alpha); return; }
+    if (reset == 0 && v.z < 0.5 && all(greaterThanEqual(huv, vec2(0.0))) && all(lessThanEqual(huv, vec2(1.0)))) {
+        vec4 h = histCR(huv);
+        vec3 mean = m1 / 5.0, sig = sqrt(max(m2 / 5.0 - mean * mean, 0.0));
+        vec3 hy = ycc(h.rgb), dv = hy - mean, u = abs(dv) / (sig * 1.25 + 1e-4);
+        float m = max(u.x, max(u.y, u.z));
+        vec3 hc = m > 1.0 ? mean + dv / m : hy;    // clip the history into the neighbourhood's colour box
+        float hw = h.a / max(m, 1.0);              // and trust it less the further it was off
+        float a = w / (hw + w);
+        res = mix(rgb(hc), cur, a);
+        w = min(hw + w, maxW);
+    }
+    oHist = vec4(res, w);
+    oDst = vec4(itm(res), alpha);
+}
+)";
+static Target g_hist[2];   // RGBA16F history, ping-pong
+static int g_hist_cur;
+static GLuint g_taa_prog, g_taa_fbo[2];
+static GLint g_taa_u[11];
+
+void post_taa_jitter(uint64_t frame, float scale, float *jx, float *jy) {
+    int phases = (int)ceilf(8.0f / (scale * scale));
+    uint32_t i = (uint32_t)(frame % phases) + 1;
+    auto halton = [](uint32_t i, uint32_t b) { float f = 1, r = 0; while (i) { f /= b; r += f * (i % b); i /= b; } return r; };
+    *jx = halton(i, 2) - 0.5f;
+    *jy = halton(i, 3) - 0.5f;
+}
+
+bool post_taa(GLuint col, GLuint dep, GLuint vel, int lw, int lh, GLuint dst, int ow, int oh, float jx, float jy, bool reset) {
+    if (!init()) return false;
+    if (!g_taa_prog) {
+        GLuint vs = compile(GL_VERTEX_SHADER, kVS), fs = compile(GL_FRAGMENT_SHADER, kTaaFS);
+        if (!vs || !fs) { g_broken = true; return false; }
+        g_taa_prog = glCreateProgram();
+        glAttachShader(g_taa_prog, vs); glAttachShader(g_taa_prog, fs); glLinkProgram(g_taa_prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        const char *n[] = {"col", "dep", "vel", "hist", "lowSize", "outSize", "jit", "maxW", "reset", "dbg"};
+        for (int i = 0; i < 10; i++) g_taa_u[i] = glGetUniformLocation(g_taa_prog, n[i]);
+        glGenFramebuffers(2, g_taa_fbo);
+        rtlog("post: temporal AA pass ready");
+    }
+    for (int i = 0; i < 2; i++) {
+        Target &t = g_hist[i];
+        if (t.tex && t.w == ow && t.h == oh) continue;
+        if (!t.tex) glGenTextures(1, &t.tex);
+        glBindTexture(GL_TEXTURE_2D, t.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, ow, oh, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        t.w = ow; t.h = oh;
+        reset = true;
+    }
+    int nx = g_hist_cur ^ 1;
+    glBindFramebuffer(GL_FRAMEBUFFER, g_taa_fbo[nx]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_hist[nx].tex, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, dst, 0);
+    GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glDrawBuffers(2, bufs);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_FRAMEBUFFER_SRGB);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMaski(0, 1, 1, 1, 1); glColorMaski(1, 1, 1, 1, 1);
+    glViewport(0, 0, ow, oh);
+    glDepthRange(0.0, 1.0);
+    glUseProgram(g_taa_prog);
+    GLuint tex[4] = {col, dep, vel, g_hist[g_hist_cur].tex};
+    for (int i = 0; i < 4; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindSampler(i, i == 3 ? g_sampler : 0);
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glUniform1i(g_taa_u[i], i);
+    }
+    float scale = (float)lw / ow;
+    glUniform2f(g_taa_u[4], (float)lw, (float)lh);
+    glUniform2f(g_taa_u[5], (float)ow, (float)oh);
+    glUniform2f(g_taa_u[6], jx, jy);
+    glUniform1f(g_taa_u[7], scale > 0.9f ? 10.0f : scale > 0.6f ? 16.0f : 24.0f);
+    glUniform1i(g_taa_u[8], reset ? 1 : 0);
+    static int dbg = getenv("FVR_TAA_DBG") ? atoi(getenv("FVR_TAA_DBG")) : 0;
+    glUniform1i(g_taa_u[9], dbg);
+    glBindVertexArray(g_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+    for (int i = 3; i >= 0; i--) { glActiveTexture(GL_TEXTURE0 + i); glBindSampler(i, 0); glBindTexture(GL_TEXTURE_2D, 0); }
+    g_hist_cur = nx;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Screen-space reflections on the track surface, at render resolution before temporal
+// accumulation (which also averages the per-frame ray jitter). Positions come from the depth
+// buffer and the camera's view-projection (ViewProjMtx, rows = clip components), normals from
+// neighbouring depths. Only near-horizontal, unsaturated surfaces (asphalt, kerb paint, the cars'
+// roofs) reflect; grass is excluded by its saturation. The game has no material information to
+// go by, so this is a heuristic.
+static const char *kSsrFS = R"(#version 410 core
+uniform sampler2D col, dep;
+uniform mat4 VP, IVP;
+uniform vec3 cam;
+uniform vec2 size;
+uniform float strength, seed;
+uniform vec2 zlin;    // depth -> view distance along the axis: w = zlin.y / (z - zlin.x)
+uniform int dbg;
+layout(location = 0) out vec4 o;
+vec3 wpos(vec2 uv, float z) { vec4 p = IVP * vec4(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, z, 1.0); return p.xyz / p.w; }
+float D(ivec2 p) { return texelFetch(dep, clamp(p, ivec2(0), ivec2(size) - 1), 0).r; }
+vec3 P(ivec2 p) { return wpos((vec2(p) + 0.5) / size, D(p)); }
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233)) + seed) * 43758.5453); }
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = texelFetch(col, p, 0);
+    o = c;
+    float z = D(p);
+    if (z >= 0.99999) return;
+    vec3 X = P(p);
+    float zl = D(p - ivec2(1, 0)), zr = D(p + ivec2(1, 0)), zd = D(p - ivec2(0, 1)), zu = D(p + ivec2(0, 1));
+    vec3 dx = abs(zr - z) < abs(z - zl) ? P(p + ivec2(1, 0)) - X : X - P(p - ivec2(1, 0));
+    vec3 dy = abs(zu - z) < abs(z - zd) ? P(p + ivec2(0, 1)) - X : X - P(p - ivec2(0, 1));
+    vec3 N = normalize(cross(dx, dy));
+    vec3 V = X - cam;
+    float dist = length(V);
+    V /= dist;
+    if (dot(N, V) > 0.0) N = -N;
+    if (dbg == 1) { o.rgb = N * 0.5 + 0.5; return; }
+    if (N.y < 0.9) return;                       // near-horizontal surfaces only
+    float mx = max(c.r, max(c.g, c.b));
+    float mask = 1.0 - smoothstep(0.04, 0.15, (c.g - max(c.r, c.b)) / (mx + 1e-4));   // not grass
+    float cosv = max(dot(-V, N), 0.0);
+    float F = (0.04 + 0.96 * pow(1.0 - cosv, 5.0)) * strength * mask;
+    if (dbg == 2) { o.rgb = vec3(F, mask, 0.0); return; }
+    if (F < 0.005) return;
+    // roughness: jitter the normal a little each frame
+    float r1 = hash(gl_FragCoord.xy), r2 = hash(gl_FragCoord.yx + 7.0);
+    N = normalize(N + 0.04 * vec3(r1 - 0.5, 0.0, r2 - 0.5));
+    vec3 R = reflect(V, N);
+    float t = dist * 0.02 * (0.5 + r1), tmax = dist * 4.0;
+    vec2 hit = vec2(-1.0), sky = vec2(-1.0);
+    float prevT = 0.0;
+    for (int i = 0; i < 16 && t < tmax; i++) {
+        vec3 Q = X + R * t;
+        vec4 q = VP * vec4(Q, 1.0);
+        if (q.w <= 0.0) break;
+        vec3 n = q.xyz / q.w;
+        vec2 suv = vec2(n.x * 0.5 + 0.5, 0.5 - 0.5 * n.y);
+        if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) break;
+        float sz = texture(dep, suv).r;
+        if (sz >= 0.99999) sky = suv;               // passing over the sky: reflect it if nothing is hit
+        if (n.z > sz && sz < 0.99999) {
+            float behind = q.w - zlin.y / (sz - zlin.x);
+            if (behind < t * 0.15 + 0.5) {          // thin enough to be the surface we went behind
+                // refine between the last two steps
+                float a = prevT, b = t;
+                for (int k = 0; k < 4; k++) {
+                    float m = 0.5 * (a + b);
+                    vec4 qm = VP * vec4(X + R * m, 1.0);
+                    vec3 nm = qm.xyz / qm.w;
+                    vec2 um = vec2(nm.x * 0.5 + 0.5, 0.5 - 0.5 * nm.y);
+                    if (nm.z > texture(dep, um).r) { b = m; suv = um; } else a = m;
+                }
+                hit = suv;
+            }
+            break;
+        }
+        prevT = t;
+        t *= 1.35;
+    }
+    float wgt = 1.0;
+    if (hit.x < 0.0 && sky.x >= 0.0) { hit = sky; wgt = 0.6; }
+    if (dbg == 3) { o.rgb = vec3(F * 4.0, hit.x >= 0.0 ? 1.0 : 0.0, 0.0); return; }
+    if (hit.x < 0.0) return;
+    vec2 e = min(hit, 1.0 - hit);
+    float fade = smoothstep(0.0, 0.08, min(e.x, e.y));
+    vec3 rc = textureLod(col, hit, 0.0).rgb;
+    o.rgb = mix(c.rgb, rc, F * fade * wgt);
+}
+)";
+static GLuint g_ssr_prog, g_ssr_fbo;
+static GLint g_ssr_u[10];
+static Target g_ssr;
+
+// Returns the texture holding colour with reflections (or col on failure).
+GLuint post_ssr(GLuint col, GLuint dep, int w, int h, const float *vp, const float *ivp, const float *cam, float strength, uint64_t frame) {
+    if (!init()) return col;
+    if (!g_ssr_prog) {
+        GLuint vs = compile(GL_VERTEX_SHADER, kVS), fs = compile(GL_FRAGMENT_SHADER, kSsrFS);
+        if (!vs || !fs) return col;
+        g_ssr_prog = glCreateProgram();
+        glAttachShader(g_ssr_prog, vs); glAttachShader(g_ssr_prog, fs); glLinkProgram(g_ssr_prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        const char *n[] = {"col", "dep", "VP", "IVP", "cam", "size", "strength", "seed", "dbg", "zlin"};
+        for (int i = 0; i < 10; i++) g_ssr_u[i] = glGetUniformLocation(g_ssr_prog, n[i]);
+        glGenFramebuffers(1, &g_ssr_fbo);
+        rtlog("post: screen-space reflections ready");
+    }
+    if (!g_ssr.tex || g_ssr.w != w || g_ssr.h != h) {
+        if (!g_ssr.tex) glGenTextures(1, &g_ssr.tex);
+        glBindTexture(GL_TEXTURE_2D, g_ssr.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_ssr_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_ssr.tex, 0);
+        g_ssr.w = w; g_ssr.h = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_ssr_fbo);
+    GLenum b0 = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1, &b0);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_FRAMEBUFFER_SRGB);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMaski(0, 1, 1, 1, 1);
+    glViewport(0, 0, w, h);
+    glUseProgram(g_ssr_prog);
+    glActiveTexture(GL_TEXTURE0); glBindSampler(0, g_sampler); glBindTexture(GL_TEXTURE_2D, col); glUniform1i(g_ssr_u[0], 0);
+    glActiveTexture(GL_TEXTURE1); glBindSampler(1, 0); glBindTexture(GL_TEXTURE_2D, dep); glUniform1i(g_ssr_u[1], 1);
+    glUniformMatrix4fv(g_ssr_u[2], 1, GL_TRUE, vp);
+    glUniformMatrix4fv(g_ssr_u[3], 1, GL_TRUE, ivp);
+    glUniform3fv(g_ssr_u[4], 1, cam);
+    glUniform2f(g_ssr_u[5], (float)w, (float)h);
+    glUniform1f(g_ssr_u[6], strength);
+    glUniform1f(g_ssr_u[7], (float)(frame % 64) * 1.618f);
+    static int dbg = getenv("FVR_SSR_DEBUG") ? atoi(getenv("FVR_SSR_DEBUG")) : 0;
+    glUniform1i(g_ssr_u[8], dbg);
+    // perspective projection: clip.z = A * clip.w + B (rows 2 and 3 of VP)
+    int k = 0;
+    for (int i = 1; i < 3; i++) if (fabsf(vp[12 + i]) > fabsf(vp[12 + k])) k = i;
+    float A = vp[12 + k] != 0 ? vp[8 + k] / vp[12 + k] : 1.0f, B = vp[11] - A * vp[15];
+    glUniform2f(g_ssr_u[9], A, B);
+    glBindVertexArray(g_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); glBindSampler(0, 0); glBindTexture(GL_TEXTURE_2D, 0);
+    return g_ssr.tex;
 }
