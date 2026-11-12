@@ -94,6 +94,7 @@ struct Buffer : Obj {
     uint32_t lock_off = 0, lock_size = 0, lock_flags = 0;
     int locks = 0;
     uint32_t dirty_lo = ~0u, dirty_hi = 0;
+    uint32_t ver = 0;           // changes whenever the contents change (ray-tracing BLAS cache)
     ~Buffer();
 };
 

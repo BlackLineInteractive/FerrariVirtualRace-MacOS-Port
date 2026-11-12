@@ -1,5 +1,10 @@
-// Ray-tracing scene capture: the game's 3D scene as triangles in world space, gathered from the
-// draws of the scene pass (d3d9.cpp), for tinybvh acceleration structures.
+// Ray-tracing scene: the game's 3D scene as tinybvh acceleration structures, gathered from the
+// draws of the scene pass (d3d9.cpp).
+//
+//   BLAS: one CWBVH (BVH8) per distinct mesh (vertex/index buffer contents and draw range), built
+//         the first time it is drawn and kept while it is in use.
+//   TLAS: one BVH2 over this frame's draws (instances: BLAS + object-to-world matrix), rebuilt at
+//         the end of every frame.
 #pragma once
 #include <cstdint>
 
@@ -16,13 +21,17 @@ struct RtDraw {
     uint32_t vb_size;            // bytes available from `pos`
     float m[16];                 // object -> world (3 rows, wvp false) or object -> clip (wvp true)
     bool wvp;                    // m is WorldViewProjMtx: world = inverse(camera) * m, at the end of the frame
-    uint64_t mesh;               // identifies the geometry (buffers and range)
+    uint32_t vb_id, vb_ver;      // identify the geometry: guest address of `pos` and buffer versions
+    uint32_t ib_id, ib_ver;
+    const char *shader;          // vertex shader's constant names (statistics)
 };
 
-// Why a draw was left out of the capture (statistics).
-enum RtSkip { RT_SKIP_SHADER, RT_SKIP_INSTANCED, RT_SKIP_UP, RT_SKIP_FORMAT, RT_SKIP_PRIM, RT_SKIP_NOCAM, RT_SKIP_N };
+// Why a draw was left out (statistics).
+enum RtSkip { RT_SKIP_SHADER, RT_SKIP_INSTANCED, RT_SKIP_UP, RT_SKIP_FORMAT, RT_SKIP_PRIM, RT_SKIP_VOLATILE,
+              RT_SKIP_BUDGET, RT_SKIP_EMPTY, RT_SKIP_N };
 
-bool rt_capture_active(uint64_t frame);
+// enabled: ray tracing is on (FVR_RT / options.txt rt=1); FVR_RT_DUMP also captures one frame.
+bool rt_capture_active(uint64_t frame, bool enabled);
 void rt_capture(const RtDraw &d);
 void rt_skip(RtSkip why, const char *what = nullptr);
 // End of the frame: vp = camera view-projection (rows = clip components), ivp its inverse.

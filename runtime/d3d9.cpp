@@ -102,6 +102,7 @@ struct Program {
     GLuint prog = 0;
     bool ff_vs = false, ff_ps = false;
     GLint vc = -1, vi = -1, vb = -1, pc = -1, pi = -1, pb = -1, posFixup = -1, alphaFunc = -1, alphaRef = -1;
+    GLint bakedFlat = -1; float u_baked[4] = {0, 0, 0, 0};   // see baked_flat()
     GLint vfaceSign = -1, fogColor = -1, fogParams = -1;
     uint64_t vs_ver = 0, ps_ver = 0;     // constant versions already uploaded (0 = nothing yet)
     Shader *vs = nullptr, *ps = nullptr;
@@ -598,6 +599,8 @@ static void buffer_flush(Buffer *b) {
     }
     b->dirty_lo = ~0u; b->dirty_hi = 0;
     b->lock_flags = 0;
+    static uint32_t gen;
+    b->ver = ++gen;
 }
 M(buf_Unlock) {
     GUARD; Buffer *b = OBJ<Buffer>(ARG(0));
@@ -1385,7 +1388,7 @@ static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t ma
     p.vc = U("vc"); p.vi = U("vi"); p.vb = U("vb"); p.pc = U("pc"); p.pi = U("pi"); p.pb = U("pb");
     p.posFixup = U("posFixup"); p.alphaFunc = U("alphaFunc"); p.alphaRef = U("alphaRef"); p.vfaceSign = U("vfaceSign");
     p.fogColor = U("fogColor"); p.fogParams = U("fogParams");
-    p.vcp = U("vcp"); p.velOn = U("velOn");
+    p.vcp = U("vcp"); p.velOn = U("velOn"); p.bakedFlat = U("bakedFlat");
     char nm[16];
     if (p.vc >= 0) { p.vcl.resize(256); for (int i = 0; i < 256; i++) { snprintf(nm, sizeof nm, "vc[%d]", i); p.vcl[i] = U(nm); } }
     if (p.pc >= 0) { p.pcl.resize(224); for (int i = 0; i < 224; i++) { snprintf(nm, sizeof nm, "pc[%d]", i); p.pcl[i] = U(nm); } }
@@ -1701,9 +1704,17 @@ static bool rt_world(RtDraw &d) {
     static const char *kSkip[] = {"InstWorld", "TypeVerts", "TruemmerMats", "SkyBallMtx", "MatHUD", "MatRHW", "TransMtx", "TransMat", "Anim"};
     for (const char *n : kSkip) if (vs->ctab.count(n)) return false;
     const float (*c)[4] = D->st.vsf;
-    if (vs->ctab_reg("WorldViewProjMtx") == 20) { memcpy(d.m, c[20], 64); d.wvp = true; return true; }
+    if (vs->ctab_reg("WorldViewProjMtx") == 20) {
+        memcpy(d.m, c[20], 64); d.wvp = true;
+        int wo = vs->ctab_reg("WorldOffset");   // the track adds it to the position first: M * translate(offset)
+        if (wo >= 0 && wo < 256)
+            for (int r = 0; r < 4; r++) d.m[r * 4 + 3] += d.m[r * 4] * c[wo][0] + d.m[r * 4 + 1] * c[wo][1] + d.m[r * 4 + 2] * c[wo][2];
+        return true;
+    }
     if (vs->ctab_reg("WorldMtx") == 0) { memcpy(d.m, c[0], 48); d.wvp = false; return true; }
     if (vs->ctab_reg("ViewProjMtx") == 16) {   // track geometry: vertices already in world space
+        // ...except billboards (distant trees): POSITION1 is the centre, POSITION0 the corner offset
+        for (auto &in : vs->sm.inputs) if (in.usage == 0 && in.index == 1) return false;
         static const float I[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         memcpy(d.m, I, 48); d.wvp = false; return true;
     }
@@ -1716,7 +1727,8 @@ static std::string rt_shader_name(Shader *vs) {
     return n.empty() ? "no CTAB" : n;
 }
 static void rt_note(int prim, uint32_t prims, uint32_t first, int32_t base, Buffer *ib, int inst) {
-    if (!D->taa_bound || !rt_capture_active(D->frame)) return;
+    static bool rt_on = fvr_option("rt", 0) > 0;
+    if (!D->taa_bound || !rt_capture_active(D->frame, rt_on)) return;
     if (inst > 1) { rt_skip(RT_SKIP_INSTANCED); return; }
     RtDraw d{};
     if (!rt_world(d)) { rt_skip(RT_SKIP_SHADER, rt_shader_name(D->st.vs).c_str()); return; }
@@ -1732,7 +1744,27 @@ static void rt_note(int prim, uint32_t prims, uint32_t first, int32_t base, Buff
     d.ib = ib && ib->mem ? H(ib->mem) : nullptr; d.i32 = ib && ib->fmt == 102;
     if (ib && !d.ib) { rt_skip(RT_SKIP_UP); return; }
     d.pos = H(st.vb->mem) + off; d.stride = st.stride; d.pos_type = pe->type; d.vb_size = st.vb->size - off;
+    static std::map<Shader *, std::string> names;
+    auto ni = names.find(D->st.vs);
+    if (ni == names.end()) ni = names.emplace(D->st.vs, rt_shader_name(D->st.vs)).first;
+    d.shader = ni->second.c_str();
+    d.vb_id = st.vb->mem + off; d.vb_ver = st.vb->ver; d.ib_id = ib ? ib->mem : 0; d.ib_ver = ib ? ib->ver : 0;
     rt_capture(d);
+}
+
+// baked_light=0..1 (options.txt / FVR_BAKED_LIGHT, 1 = the game's look): the track's baked light is
+// its vertex colour COLOR1 (squared and scaled by AmbLevel c37.w in the vertex shader), sky light with
+// the occlusion of the surroundings already in it. Below 1 it is blended towards an even sky light
+// (the track's average, unoccluded), so the shading comes from GTAO / ray tracing instead.
+static void baked_flat(Program *p) {
+    static float k = std::min(std::max(fvr_option("baked_light", 1), 0.0f), 1.0f);
+    float v[4] = {0, 0, 0, 0};
+    if (k < 1 && D->st.vs && D->st.vs->ctab.count("AmbLevel")) {
+        static const float sky[3] = {0.26f, 0.34f, 0.41f};   // mean COLOR1^2 over Mugello / 0.87
+        float a = D->st.vsf[37][3];
+        v[0] = sky[0] * a; v[1] = sky[1] * a; v[2] = sky[2] * a; v[3] = 1 - k;
+    }
+    if (memcmp(v, p->u_baked, 16)) { glUniform4fv(p->bakedFlat, 1, v); memcpy(p->u_baked, v, 16); }
 }
 
 // dkey: identifies the draw's geometry range (motion-vector matching across frames)
@@ -1751,6 +1783,7 @@ static Program *prepare_draw(uint64_t dkey = 0) {
         if (want != D->vel_mask) { glColorMaski(1, want, want, want, want); D->vel_mask = want; }
         if (p->vel) vel_setup(p, dkey);
     }
+    if (p->bakedFlat >= 0) baked_flat(p);
     bind_textures(p);
     if (D->rt[0] && D->rt[0]->container) D->rt[0]->container->rendered = true;   // mips need regeneration
     return p;
@@ -2284,9 +2317,11 @@ M(dev_GetDepthStencilSurface) {
 }
 M(dev_BeginScene) { GUARD; D->in_scene = true; RETN(1, D3D_OK); }
 M(dev_EndScene) { GUARD; D->in_scene = false; glFlush(); RETN(1, D3D_OK); }
+static bool cube_skip();
 M(dev_Clear) {
     GUARD;
     uint32_t count = ARG(1), rects = ARG(2), flags = ARG(3), color = ARG(4), stencil = ARG(6);
+    if (cube_skip()) color &= 0xFF000000u;   // game reflections off: black cube faces
     float z = ARGF(5);
     if (rtlog_frame()) rtlog("Clear flags %x draws %u", flags, (unsigned)D->draws);
     {
@@ -2455,8 +2490,17 @@ M(dev_GetSoftwareVertexProcessing) { RETN(1, 0); }
 M(dev_SetNPatchMode) { RETN(2, D3D_OK); }
 M(dev_GetNPatchMode) { RETN(1, 0); }
 
+// reflections=0 (options.txt / FVR_REFLECTIONS): the game's own reflections are off. Nothing is drawn
+// into cube-map faces (about half of a race frame's draws) and their clears are black, so the car
+// paint, windows and water reflect nothing until ray-traced or screen-space reflections replace them.
+static bool cube_skip() {
+    static bool off = fvr_option("reflections", 1) <= 0;
+    Surface *r = D->rt[0];
+    return off && r && r->container && r->container->target == GL_TEXTURE_CUBE_MAP;
+}
 M(dev_DrawPrimitive) {
     GUARD;
+    if (cube_skip()) RETN(4, D3D_OK);
     uint32_t count; GLenum mode = prim_mode(ARG(1), ARG(3), &count);
     if (!count) RETN(4, D3D_OK);
     Program *p = prepare_draw(((uint64_t)ARG(1) << 56) ^ ((uint64_t)ARG(2) << 24) ^ count);
@@ -2468,6 +2512,7 @@ M(dev_DrawPrimitive) {
 }
 M(dev_DrawIndexedPrimitive) {
     GUARD;
+    if (cube_skip()) RETN(7, D3D_OK);
     uint32_t count; GLenum mode = prim_mode(ARG(1), ARG(6), &count);
     Buffer *ib = D->st.ib;
     if (!count || !ib) RETN(7, D3D_OK);
@@ -2485,12 +2530,13 @@ M(dev_DrawIndexedPrimitive) {
 }
 M(dev_DrawPrimitiveUP) {
     GUARD;
+    if (cube_skip()) RETN(5, D3D_OK);
     uint32_t count; GLenum mode = prim_mode(ARG(1), ARG(2), &count);
     uint32_t stride = ARG(4);
     if (!count) RETN(5, D3D_OK);
     set_stream(0, nullptr, 0, 0);
     D->up_draws++;
-    if (D->taa_bound && rt_capture_active(D->frame)) rt_skip(RT_SKIP_UP);
+    if (D->taa_bound && rt_capture_active(D->frame, false)) rt_skip(RT_SKIP_UP);
     Program *p = prepare_draw(0x5550000000000000ull ^ count);
     glBindBuffer(GL_ARRAY_BUFFER, D->up_vbo);
     glBufferData(GL_ARRAY_BUFFER, count * stride, H(ARG(3)), GL_STREAM_DRAW);
@@ -2500,6 +2546,7 @@ M(dev_DrawPrimitiveUP) {
 }
 M(dev_DrawIndexedPrimitiveUP) {
     GUARD;
+    if (cube_skip()) RETN(9, D3D_OK);
     uint32_t count; GLenum mode = prim_mode(ARG(1), ARG(4), &count);
     uint32_t minv = ARG(2), nv = ARG(3), stride = ARG(8);
     (void)minv;

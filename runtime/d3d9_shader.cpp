@@ -706,6 +706,7 @@ std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow
     s += PRELUDE;
     s += "uniform vec4 pc[256];\nuniform ivec4 pi[16];\nuniform bool pb[16];\n";
     s += "uniform int alphaFunc;\nuniform float alphaRef;\nuniform float vfaceSign;\n";
+    s += "uniform vec4 bakedFlat;\n";   // COLOR1 (baked light) -> mix(COLOR1, xyz, w); see d3d9.cpp baked_flat
     s += "uniform vec4 fogColor;\nuniform vec4 fogParams;\n";   // x: mode (0 off), y: start, z: end, w: density
     for (int i = 0; i < 16; i++) {
         if (!(ps.samplers_used & (1 << i))) continue;
@@ -757,6 +758,8 @@ std::string sm_ps_source(const SmShader &ps, const SmShader *vs, uint16_t shadow
         int nc = popcnt4(i.mask ? i.mask : 15);
         if (nc == 4) s += "    " + i.reg + " = " + v + ";\n";
         else s += "    " + i.reg + "." + mask_str(i.mask) + " = " + v + "." + comps(nc) + ";\n";
+        if (i.usage == 10 && i.index == 1)
+            s += "    " + i.reg + ".xyz = mix(" + i.reg + ".xyz, bakedFlat.xyz, bakedFlat.w);\n";
     }
     if (ps.uses_vpos) s += "    vpos = vec4(gl_FragCoord.xy - 0.5, 0.0, 1.0);\n";
     if (ps.uses_vface) s += "    vface = gl_FrontFacing ? vfaceSign : -vfaceSign;\n";

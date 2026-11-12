@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <vector>
 #include <cstring>
+#include <string>
 
 static bool compile(GLenum type, const std::string &src, std::string &log) {
     GLuint sh = glCreateShader(type);
@@ -54,6 +55,13 @@ int main(int argc, char **argv) {
             printf("%06zx %s_%d_%d: GL FAIL\n%s\n", off, s.ps ? "ps" : "vs", s.major, s.minor, log.c_str());
             if (verbose) printf("%s\n", src.c_str());
         } else if (verbose) printf("%06zx ok\n", off);
+        // shadertest <exe> v <name>: print the GLSL of every shader whose constant table names <name>
+        if (argc > 3 && std::string((const char *)&d[off], len * 4).find(argv[3]) != std::string::npos)
+        {
+            printf("==== %06zx %s inputs:", off, s.ps ? "ps" : "vs");
+            for (auto &in : s.inputs) printf(" %s=%d/%d", in.reg.c_str(), in.usage, in.index);
+            printf("\n%s\n", verbose ? src.c_str() : "");
+        }
         // temporal AA velocity variant
         std::string vsrc = s.ps ? sm_ps_source(s, nullptr, 0, true) : sm_vs_source(s, nullptr, true);
         if (!compile(s.ps ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, vsrc, log)) {

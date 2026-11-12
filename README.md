@@ -68,6 +68,19 @@ ssr=0.8
 
 **Reflections**: the track surface reflects the cars, buildings and sky at grazing angles. The game has no material data, so it is applied to near-horizontal surfaces that are not grass. Reflections cost about 4 ms with `Temporal 2x` at 4K and much more at native 4K, so use them with `Temporal 1.5x` or `Temporal 2x`.
 
+### The game's own reflections and baked light
+
+Two more `options.txt` settings take out what the game bakes in, so that ambient occlusion now, and ray tracing later, do that work instead:
+
+```text
+reflections=0
+baked_light=0
+```
+
+**`reflections=0`** turns off the game's reflections: the cube map around the player's car is no longer drawn (it is cleared to black), so the paint, windows and water stop reflecting it. This removes about half of a race frame's draw calls (11,600 down to 5,200), the main limit on the frame rate. Ray-traced reflections are meant to replace it.
+
+**`baked_light`** (0 to 1, default 1) blends the track's baked light (its vertex colours: sky light with the occlusion of the surroundings in it) towards an even sky light. At 0 the shading under roofs, along walls and between buildings comes from `ao` instead.
+
 ## How It Works
 
 1. **Function Discovery (`ghidra/`)** - [ExportFuncs.java](ghidra/ExportFuncs.java) exports function boundaries and computed-jump targets from `FerrariVR_Hi.exe` into [funcs_hi.jsonl](ghidra/funcs_hi.jsonl).
@@ -122,7 +135,9 @@ On first launch, [config.cpp](runtime/config.cpp) writes a default windowed `Con
 | `FVR_TAA_SCALE` | Override the render scale of the temporal modes (e.g. `0.75`) |
 | `FVR_FPS=1` | Print FPS every two seconds, explain slow frames, and log the GPU time of the scene, reflection and temporal passes |
 | `FVR_VSYNC=0` | Turn vertical sync off (benchmarks) |
-| `FVR_RT_DUMP=<seconds>` | Ray-tracing capture check (with a `Temporal` mode): gathers the scene of the first frame after that time as world-space triangles, builds a [tinybvh](third_party/tiny_bvh.h) BVH and saves a CPU-traced view from the game's camera as `rt_dump.ppm` in `FVR_SHOT_DIR` |
+| `FVR_REFLECTIONS`, `FVR_BAKED_LIGHT` | Override `reflections` / `baked_light` from `options.txt` |
+| `FVR_RT=1` | Ray-tracing scene (with a `Temporal` mode): keeps a [tinybvh](third_party/tiny_bvh.h) CWBVH per mesh and a TLAS over each frame's draws; `FVR_RT_STATS=1` logs instances, triangles and build times once a second; `FVR_RT_BUDGET` (ms per frame for new meshes, default 6) |
+| `FVR_RT_DUMP=<seconds>` | Ray-tracing check: traces the first frame after that time on the CPU through the TLAS and every instance's CWBVH from the game's camera (one colour per instance) and saves `rt_dump.ppm` in `FVR_SHOT_DIR` |
 | `FVR_GL_MT=0` | Disable Apple's multithreaded GL engine |
 | `FVR_KEYS` | Scripted key presses `ms:Key[:holdms],...`; the real keyboard and mouse are ignored while set. `9000:Return,12000:Return,15000:Return,18000:Return,21000:Return,24000:Return` drives the menus into a race |
 | `FVR_SHOT_DIR` + `FVR_SHOT_FRAMES` / `FVR_SHOT_SECS` | Dump the back buffer as PPM at given frame numbers or seconds; `FVR_SHOT_POST=1` also dumps the window after post-processing |

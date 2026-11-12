@@ -16,7 +16,7 @@ build/fvr: $(GEN_OBJ) $(RT_OBJ)
 	$(CXX) $(ARCH) -o $@ $^ $(LIBS)
 
 # tinybvh (third_party/tiny_bvh.h) is compiled into rt_scene.o: optimise it
-build/rt/rt_scene.o: CXXFLAGS += -O3 -Wno-unused-but-set-variable -Wno-unused-parameter
+build/rt/rt_scene.o: CXXFLAGS += -O3 -mavx2 -mfma -Wno-unused-but-set-variable -Wno-unused-parameter
 
 build/shadertest: tests/shadertest.cpp build/rt/d3d9_shader.o
 	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags sdl3 2>/dev/null) -o $@ $^ $(shell pkg-config --libs sdl3 2>/dev/null) -framework OpenGL
