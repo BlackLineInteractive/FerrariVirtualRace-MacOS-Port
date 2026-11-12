@@ -1059,6 +1059,40 @@ GLuint post_ao(GLuint col, GLuint dep, int w, int h, const float *vp, const floa
 GLuint post_ssr(GLuint col, GLuint dep, int w, int h, const float *vp, const float *ivp, const float *cam, float strength, uint64_t frame);
 // Player options outside the game's menus: environment FVR_<NAME>, else "name=value" lines in
 // options.txt in the user folder.
+// options.txt as written on the first run (also the reference for the README's settings table).
+static const char *kOptionsTemplate =
+    "# Ferrari Virtual Race (macOS port): graphics settings beyond the game's own Video settings menu.\n"
+    "# Lines are name = value; # starts a comment. Each setting can also be set for one run with an\n"
+    "# environment variable FVR_<NAME> (for example FVR_RT=1).\n"
+    "#\n"
+    "# ao, ssr and rt need one of the Temporal entries of the in-game Antialias setting.\n"
+    "\n"
+    "# Ambient occlusion (GTAO): strength, 0 = off. About 5 ms with Temporal 2x at 4K.\n"
+    "ao = 0\n"
+    "\n"
+    "# Screen-space reflections on the track: strength, 0 = off. Best with Temporal 1.5x / 2x.\n"
+    "ssr = 0\n"
+    "\n"
+    "# Physically based car materials (GGX, clear coat, Fresnel glass): 1 = on.\n"
+    "pbr = 0\n"
+    "\n"
+    "# Ray-traced reflections on car paint, glass and chrome (Metal): 1 = on. Turns on pbr.\n"
+    "rt = 0\n"
+    "\n"
+    "# Rays through glass too: 1 = on. The shipped cars' glass has no thickness, so this changes\n"
+    "# nothing for them; it is for car models with real glass.\n"
+    "rt_refract = 0\n"
+    "\n"
+    "# The game's own car reflections (a cube map drawn every frame, about half of all draw calls):\n"
+    "# 1 = on, 0 = off. With rt = 1, ray tracing replaces them.\n"
+    "reflections = 1\n"
+    "\n"
+    "# The track's baked light: 1 = as the game, 0 = even sky light (shading then comes from ao).\n"
+    "baked_light = 1\n"
+    "\n"
+    "# Suggested set for ray tracing (with Antialias = Temporal 2x):\n"
+    "#   ao = 0.8, rt = 1, reflections = 0\n";
+
 static float fvr_option(const char *name, float def) {
     std::string env = "FVR_" + std::string(name);
     for (char &ch : env) ch = (char)toupper((unsigned char)ch);
@@ -1066,7 +1100,14 @@ static float fvr_option(const char *name, float def) {
     static std::map<std::string, float> opts; static bool loaded;
     if (!loaded) {
         loaded = true;
-        if (FILE *f = fopen((g_user_dir + "/options.txt").c_str(), "r")) {
+        std::string path = g_user_dir + "/options.txt";
+        if (FILE *f = fopen(path.c_str(), "r")) fclose(f);
+        else if (FILE *w = fopen(path.c_str(), "w")) {   // first run: every setting, commented
+            fputs(kOptionsTemplate, w);
+            fclose(w);
+            rtlog("d3d9: wrote %s", path.c_str());
+        }
+        if (FILE *f = fopen(path.c_str(), "r")) {
             char line[256];
             while (fgets(line, sizeof line, f)) {
                 char k[64]; float v;
@@ -1078,8 +1119,8 @@ static float fvr_option(const char *name, float def) {
     auto it = opts.find(name);
     return it != opts.end() ? it->second : def;
 }
-// Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 keeps the scene's acceleration structures;
-// rt_view=1 also traces it on the GPU and shows that instead of the game's image (a check).
+// Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 traces reflections on mirror-like car surfaces;
+// rt_view=1/2 traces primary rays and shows them instead of the game's image (a check).
 GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint tcol, GLuint cube, const float *vp, const float *ivp, const float *cam);
 // rt=1: ray-traced reflections on the mirror-like car surfaces (PBR material, implies pbr=1)
 static bool rt_reflections() { static bool on = fvr_option("rt", 0) > 0; return on; }
@@ -1112,7 +1153,8 @@ static void taa_resolve(Surface *dst) {
         float ivp2[16];
         if (mat4_inv(D->vp_cur, ivp2))
             if (GLuint hit = rt_trace_reflect(D->frame, D->vp_cur, D->rt_cam, rt_refract()))
-                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, rtm_hit_colour(), rtm_glass(), D->rt_cube, D->vp_cur, ivp2, D->rt_cam);
+                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, rtm_hit_colour(), rtm_glass(),
+                              fvr_option("reflections", 1) > 0 ? D->rt_cube : 0, D->vp_cur, ivp2, D->rt_cam);
     }
     static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
     float ivp[16];

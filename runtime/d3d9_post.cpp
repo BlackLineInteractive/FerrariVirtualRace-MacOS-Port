@@ -845,7 +845,8 @@ GLuint post_ao(GLuint col, GLuint dep, int w, int h, const float *vp, const floa
 // (m0 = direction, m1 = position - camera and weight) and left the hit points in `hit`. The colour
 // at a hit is the frame's own colour where the hit point is visible on screen (exact reflection,
 // with parallax and contact), otherwise the game's reflection cube in that direction (also for
-// misses: the sky). Added to the scene colour with the material's weight.
+// misses: the sky; with the game's reflections off, Metal's sky colour). Added to the scene colour
+// with the material's weight.
 static const char *kRtFS = R"(#version 410 core
 uniform sampler2D col, dep;
 uniform sampler2DRect m0, m1, hit, hcol, tcol;
@@ -862,7 +863,7 @@ void main() {
     if (!(b.w > 0.0)) { if (dbg != 0) o.rgb *= 0.25; return; }
     vec3 R = normalize(texelFetch(m0, p).xyz);
     vec4 h = texelFetch(hit, p);
-    vec3 L = haveEnv != 0 ? textureLod(env, R, 0.0).rgb : vec3(0.0);
+    vec3 L = haveEnv != 0 ? textureLod(env, R, 0.0).rgb : texelFetch(hcol, p).rgb;   // sky: the game's cube, else Metal's
     int kind = 0;                                  // 0 cube (miss), 1 screen, 2 shaded by Metal (off screen)
     if (h.w > 0.5 && h.w < 1.5) {
         L = texelFetch(hcol, p).rgb; kind = 2;

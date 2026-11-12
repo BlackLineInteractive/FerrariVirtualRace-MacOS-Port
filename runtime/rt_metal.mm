@@ -318,7 +318,16 @@ kernel void rt_reflect(device const float4 *nodes [[buffer(0)]], device const fl
     }
     float tMax = 1e5f;
     Hit hit; hit.t = tMax; hit.n = float3(0, 1, 0); hit.inst = 0xFFFFFFFFu; hit.prim = 0u; hit.u = hit.v = 0.0f;
-    if (!trace(sc, O, R, tMin, tMax, hit)) { out.write(float4(0.0f, 0.0f, 0.0f, 2.0f), gid); return; }
+    if (!trace(sc, O, R, tMin, tMax, hit)) {
+        // sky, for when the game's cube map is off: the hemisphere's upper colour, brighter towards
+        // the horizon, plus the sun
+        const float3 S = normalize(L.sunDir.xyz);
+        const float hz = 1.0f - saturate(R.y);
+        const float3 sky = L.ambHi.rgb * (1.0f + 0.6f * hz * hz) + L.sunCol.rgb * 4.0f * pow(saturate(dot(R, S)), 400.0f);
+        col.write(half4(half3(sky), 1.0h), gid);
+        out.write(float4(0.0f, 0.0f, 0.0f, 2.0f), gid);
+        return;
+    }
     const float3 X = O + R * hit.t;
     out.write(float4(X, 1.0f), gid);
     col.write(half4(half3(shadeHit(sc, L, hit, X, R)), 1.0h), gid);
@@ -496,15 +505,23 @@ void rtm_textures(const uint32_t *texels, size_t n_texels, size_t from_texels, c
 unsigned rtm_hit_colour() { return S.hcol.gl; }
 unsigned rtm_glass() { return S.tcol.gl; }
 
-void rtm_merged(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris, const void *attr, size_t n_attr) {
-    if (!init()) return;
-    bool grew;
-    S.mattr = ensure(S.mattr, n_attr * 40 + 64, &grew);
-    upload(S.mattr, attr, 0, n_attr * 40);
-    S.mnodes = ensure(S.mnodes, n_nodes * 16 + 16, &grew);
-    upload(S.mnodes, nodes, 0, n_nodes * 16);
-    S.mtris = ensure(S.mtris, n_tris * 16 + 16, &grew);
-    upload(S.mtris, tris, 0, n_tris * 16);
+void *rtm_merged_prepare(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris, const void *attr, size_t n_attr) {
+    if (!S.ok) return nullptr;
+    @autoreleasepool {
+        auto make = [](const void *src, size_t bytes) {
+            id<MTLBuffer> b = [S.dev newBufferWithLength:bytes + 64 options:MTLResourceStorageModeManaged];
+            memcpy(b.contents, src, bytes);
+            [b didModifyRange:NSMakeRange(0, bytes)];
+            return b;
+        };
+        NSArray *a = @[make(nodes, n_nodes * 16), make(tris, n_tris * 16), make(attr, n_attr * 40)];
+        return (void *)CFBridgingRetain(a);
+    }
+}
+void rtm_merged_commit(void *prepared) {
+    if (!prepared) return;
+    NSArray *a = (NSArray *)CFBridgingRelease(prepared);
+    S.mnodes = a[0]; S.mtris = a[1]; S.mattr = a[2];
 }
 
 unsigned rtm_trace_view(const RtmInst *inst, size_t n_inst, const void *tlas_nodes, size_t n_tlas, const uint32_t *prim, size_t n_prim,

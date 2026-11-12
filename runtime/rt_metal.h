@@ -26,7 +26,10 @@ bool rtm_available();
 // BLAS data (float4 counts). Everything from `from_*` on is new since the last call; 0 = all of it.
 void rtm_blas(const void *nodes, size_t n_nodes, size_t from_nodes, const void *tris, size_t n_tris, size_t from_tris);
 // The merged world-space BLAS (RtmInst::pad = 1 selects it), replacing the previous one.
-void rtm_merged(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris, const void *attr, size_t n_attr);
+// Metal buffers for a merged BLAS, made on any thread (the merge worker); handed to rtm_merged_commit
+// on the game thread, which only swaps them in.
+void *rtm_merged_prepare(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris, const void *attr, size_t n_attr);
+void rtm_merged_commit(void *prepared);
 // Triangle attribute records (40 bytes each) of every BLAS; from `from` on is new (0: all).
 void rtm_attrs(const void *attr, size_t n, size_t from);
 // Texels (RGBA8 words) and texture infos (offset, w, h, pad); texels from `from_texels` on are new.

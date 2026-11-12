@@ -73,7 +73,7 @@ struct Blas {
     uint32_t attr_base = 0;
 };
 static std::unordered_map<MeshKey, std::unique_ptr<Blas>, MeshKeyHash> g_blas;
-struct SlotInfo { uint32_t vbv, ibv; uint64_t changed; int rapid; bool known; };
+struct SlotInfo { uint32_t vbv, ibv; uint64_t changed; int rapid; bool known; Blas *last = nullptr; };
 static std::unordered_map<MeshKey, SlotInfo, MeshKeyHash> g_slots;
 
 // ---------------------------------------------------------------- this frame's instances
@@ -115,7 +115,10 @@ static size_t g_world_kept;                    // persisted instances added to t
 // The remembered track merged into one world-space CWBVH (as the static group of the path tracer):
 // overlapping track pieces as separate TLAS leaves make every ray test hundreds of them. Built in
 // a background thread whenever enough new pieces are known; pieces in it leave the TLAS.
+struct Piece { const Blas *b; float w[12]; int tex; float uvm[8]; bool has_uvm; };
 struct Merge {
+    std::vector<Piece> pieces;             // input, snapshot of the remembered track
+    void *gpu = nullptr;                   // Metal buffers made by the worker (rtm_merged_prepare)
     std::unique_ptr<Blas> blas;
     std::unordered_set<WKey, WKeyHash> keys;
     std::vector<bvhvec4> nodes, tris;      // packed for the GPU
@@ -125,13 +128,36 @@ struct Merge {
 static std::unique_ptr<Merge> g_merged;
 static Merge *g_merge_job;                     // being built (owned by the worker until done)
 static std::atomic<bool> g_merge_done{false};
-static bool g_merged_new;                      // the GPU needs it
 static uint64_t g_merge_started;
 static size_t g_merge_pending;                 // remembered pieces not merged yet (stats)
 
+static inline bvhvec3 xp(const float *w, const bvhvec3 &p);
+
+// Worker thread: the remembered pieces in world space, their attributes, the CWBVH and the Metal
+// buffers, so the game thread only swaps them in.
 static void merge_build(Merge *m) {
     auto t0 = Clock::now();
-    Blas &b = *m->blas;
+    Blas &mb = *m->blas;
+    for (const Piece &pc : m->pieces) {
+        const Blas &b = *pc.b;
+        for (uint32_t t = 0; t < b.tris * 3; t++) {
+            bvhvec3 p = xp(pc.w, bvhvec3(b.v[b.idx[t]]));
+            mb.v.push_back(bvhvec4(p.x, p.y, p.z, 0));
+            mb.lo = tinybvh::tinybvh_min(mb.lo, p); mb.hi = tinybvh::tinybvh_max(mb.hi, p);
+        }
+        for (uint32_t t = 0; t < b.tris; t++) {
+            TriAttr a = b.attr[t];
+            if (pc.has_uvm)
+                for (int k = 0; k < 3; k++) {
+                    float u = a.uv[k * 2], v = a.uv[k * 2 + 1];
+                    a.uv[k * 2] = pc.uvm[0] * u + pc.uvm[1] * v + pc.uvm[2];
+                    a.uv[k * 2 + 1] = pc.uvm[4] * u + pc.uvm[5] * v + pc.uvm[6];
+                }
+            a.tex = (a.tex & kHasBaked) | (pc.tex >= 0 ? (uint32_t)pc.tex : kTexInst);
+            m->attr.push_back(a);
+        }
+    }
+    Blas &b = mb;
     b.tris = (uint32_t)(b.v.size() / 3);
     b.idx.resize(b.v.size());
     for (uint32_t i = 0; i < b.idx.size(); i++) b.idx[i] = i;
@@ -139,6 +165,7 @@ static void merge_build(Merge *m) {
     m->nodes.assign(b.bvh.bvh8Data, b.bvh.bvh8Data + b.bvh.usedBlocks);
     uint32_t tri_blocks = std::max(b.tris, b.bvh.bvh8.idxCount) * 4;
     m->tris.assign(b.bvh.bvh8Tris, b.bvh.bvh8Tris + tri_blocks);
+    m->gpu = rtm_merged_prepare(m->nodes.data(), m->nodes.size(), m->tris.data(), m->tris.size(), m->attr.data(), m->attr.size());
     m->ms = ms_since(t0);
     g_merge_done = true;
 }
@@ -177,10 +204,11 @@ static double dump_time() {
 }
 static bool stats_on() { static int on = -1; if (on < 0) on = getenv("FVR_RT_STATS") ? atoi(getenv("FVR_RT_STATS")) : 0; return on > 0; }
 
+static void take_finished_jobs();
 bool rt_capture_active(uint64_t frame, bool enabled) {
     if (g_dump_state == 0 && dump_time() >= 0 && SDL_GetTicks() / 1000.0 >= dump_time()) { g_dump_state = 1; g_dump_frame = frame; }
     bool on = enabled || (g_dump_state == 1 && frame == g_dump_frame);
-    if (on && frame != g_frame) { g_frame = frame; g_inst.clear(); }
+    if (on && frame != g_frame) { g_frame = frame; g_inst.clear(); take_finished_jobs(); }
     return on;
 }
 
@@ -190,7 +218,7 @@ void rt_skip(RtSkip why, const char *what) {
 }
 
 // Gathers the draw's triangles in object space. False when nothing usable is left.
-static bool fill_blas(const RtDraw &d, Blas &b) {
+static bool fill_blas(const RtDraw &d, Blas &b, bool build = true) {
     uint32_t nidx = d.prim == 4 ? d.prims * 3 : d.prims + 2;
     auto index = [&](uint32_t k) -> int64_t {
         if (!d.ib) return (int64_t)d.first + k;
@@ -250,7 +278,7 @@ static bool fill_blas(const RtDraw &d, Blas &b) {
         }
         a.tex = kTexInst | (d.col ? kHasBaked : 0);
     }
-    b.bvh.Build(b.v.data(), b.idx.data(), (uint32_t)(b.idx.size() / 3));
+    if (build) b.bvh.Build(b.v.data(), b.idx.data(), (uint32_t)(b.idx.size() / 3));
     return true;
 }
 
@@ -260,7 +288,27 @@ static double build_budget_ms() {
     return ms;
 }
 
+// Large meshes whose contents changed (a car body deformed by a crash) are rebuilt in a worker
+// thread; until it is done the draw keeps using the previous BLAS of the same draw range.
+struct BlasJob { MeshKey key; Blas *b; std::atomic<bool> done{false}; };
+static std::vector<BlasJob *> g_jobs;
+static void take_finished_jobs() {
+    for (size_t i = 0; i < g_jobs.size();) {
+        BlasJob *j = g_jobs[i];
+        if (!j->done) { i++; continue; }
+        pack(*j->b);
+        g_slots[slot_of(j->key)].last = j->b;
+        g_blas.emplace(j->key, std::unique_ptr<Blas>(j->b));
+        delete j;
+        g_jobs[i] = g_jobs.back(); g_jobs.pop_back();
+    }
+}
+static bool job_pending(const MeshKey &k) { for (auto *j : g_jobs) if (j->key == k) return true; return false; }
+static double g_cap_ms, g_upload_ms;           // this frame: capture (incl. BLAS builds), uploads
+struct Peaks { double cap, tlas, upload, trace, all; } g_peak;
 void rt_capture(const RtDraw &d) {
+    auto tc = Clock::now();
+    struct Acc { Clock::time_point t; ~Acc() { g_cap_ms += ms_since(t); } } acc{tc};
     if (d.pos_type != 2 && d.pos_type != 3) { g_skips[RT_SKIP_FORMAT]++; return; }
     if (d.prim != 4 && d.prim != 5) { g_skips[RT_SKIP_PRIM]++; return; }
     MeshKey k{d.vb_id, d.vb_ver, d.ib_id, d.ib_ver, d.stride, d.first, d.prims, d.uv ? d.uv_id : 0, d.col ? d.col_id : 0, d.base_vertex,
@@ -277,6 +325,21 @@ void rt_capture(const RtDraw &d) {
         s.vbv = k.vbv; s.ibv = k.ibv;
         if (s.rapid >= 3 && g_frame - s.changed <= 8) { g_skips[RT_SKIP_VOLATILE]++; return; }
         bool dump = g_dump_state == 1 && g_frame == g_dump_frame;
+        if (s.last && d.prims >= 3000 && !dump) {   // changed large mesh: rebuild in the background
+            b = s.last;
+            if (!job_pending(k) && g_jobs.size() < 4) {
+                auto *nb = new Blas;
+                if (fill_blas(d, *nb, false)) {
+                    BlasJob *j = new BlasJob; j->key = k; j->b = nb;
+                    g_jobs.push_back(j);
+                    std::thread([j] { j->b->bvh.Build(j->b->v.data(), j->b->idx.data(), (uint32_t)(j->b->idx.size() / 3)); j->done = true; }).detach();
+                } else delete nb;
+            }
+        }
+    }
+    if (!b) {
+        SlotInfo &s = g_slots[slot_of(k)];
+        bool dump = g_dump_state == 1 && g_frame == g_dump_frame;
         if (!dump && g_build_ms > build_budget_ms()) { g_skips[RT_SKIP_BUDGET]++; return; }   // next frame
         auto t0 = Clock::now();
         auto nb = std::make_unique<Blas>();
@@ -286,6 +349,7 @@ void rt_capture(const RtDraw &d) {
         g_new_blas++; g_new_tris += nb->tris;
         pack(*nb);
         b = nb.get();
+        s.last = b;
         g_blas.emplace(k, std::move(nb));
     }
     b->used = g_frame;
@@ -376,9 +440,12 @@ static bool build_tlas(const float *vp) {
     // the merged track: take a finished build, drop the pieces it holds
     if (g_merge_done) {
         g_merge_done = false;
+        Merge *old = g_merged.release();   // freeing ~100 MB takes tens of ms: not on the game thread
+        if (old) std::thread([old] { delete old; }).detach();
         g_merged.reset(g_merge_job);
         g_merge_job = nullptr;
-        g_merged_new = true;
+        rtm_merged_commit(g_merged->gpu);
+        g_merged->gpu = nullptr;
         if (stats_on()) rtlog("rt: merged track rebuilt: %zu pieces, %u triangles, %.0f ms in the background", g_merged->keys.size(), g_merged->blas->tris, g_merged->ms);
     }
     {
@@ -412,35 +479,21 @@ static bool build_tlas(const float *vp) {
         memcpy(in.w, I, 48); memcpy(in.iw, I, 48);
         g_inst.push_back(in);
     }
-    // start a new merge when enough new pieces are known (at most once a second)
-    if (!g_merge_job && g_merge_pending >= 32 && SDL_GetTicks() - g_merge_started >= 1000) {
+    // start a new merge when enough new pieces are known (at most every 3 seconds); the game
+    // thread only takes a snapshot of the remembered pieces
+    if (!g_merge_job && g_merge_pending >= 64 && SDL_GetTicks() - g_merge_started >= 3000 && rtm_available()) {
         g_merge_started = SDL_GetTicks();
         Merge *m = new Merge;
         m->blas = std::make_unique<Blas>();
-        Blas &mb = *m->blas;
+        size_t tris = 0;
         for (auto &e : g_world) {
             if (e.second.frames < (uint32_t)world_frames()) continue;
             m->keys.insert(e.first);
-            const Blas &b = *e.first.b;
-            for (uint32_t t = 0; t < b.tris * 3; t++) {
-                bvhvec3 p = xp(e.second.w, bvhvec3(b.v[b.idx[t]]));
-                mb.v.push_back(bvhvec4(p.x, p.y, p.z, 0));
-                mb.lo = tinybvh::tinybvh_min(mb.lo, p); mb.hi = tinybvh::tinybvh_max(mb.hi, p);
-            }
-            const WorldInst &wi = e.second;
-            for (uint32_t t = 0; t < b.tris; t++) {
-                TriAttr a = b.attr[t];
-                if (wi.has_uvm)
-                    for (int k = 0; k < 3; k++) {
-                        float u = a.uv[k * 2], v = a.uv[k * 2 + 1];
-                        a.uv[k * 2] = wi.uvm[0] * u + wi.uvm[1] * v + wi.uvm[2];
-                        a.uv[k * 2 + 1] = wi.uvm[4] * u + wi.uvm[5] * v + wi.uvm[6];
-                    }
-                a.tex = (a.tex & kHasBaked) | (wi.tex >= 0 ? (uint32_t)wi.tex : kTexInst);
-                m->attr.push_back(a);
-            }
+            Piece pc; pc.b = e.first.b; memcpy(pc.w, e.second.w, 48); pc.tex = e.second.tex; memcpy(pc.uvm, e.second.uvm, 32); pc.has_uvm = e.second.has_uvm;
+            m->pieces.push_back(pc);
+            tris += e.first.b->tris;
         }
-        if (mb.v.size() >= 12) { g_merge_job = m; std::thread(merge_build, m).detach(); }
+        if (tris >= 4) { g_merge_job = m; std::thread(merge_build, m).detach(); }
         else delete m;
     }
     n = g_inst.size();
@@ -465,7 +518,10 @@ static void evict(uint64_t frame) {
     if (frame % 600) return;
     size_t before = g_blas.size();
     for (auto it = g_blas.begin(); it != g_blas.end();)
-        if (frame - it->second->used > 3600) it = g_blas.erase(it); else ++it;
+        if (frame - it->second->used > 3600) {
+            for (auto &sl : g_slots) if (sl.second.last == it->second.get()) sl.second.last = nullptr;
+            it = g_blas.erase(it);
+        } else ++it;
     if (g_blas.size() != before) {   // repack what is left
         g_pnodes.clear(); g_ptris.clear(); g_pattr.clear(); g_up_nodes = g_up_tris = g_up_attr = 0;
         for (auto &k : g_blas) pack(*k.second);
@@ -731,16 +787,13 @@ static bool gpu_frame(uint64_t frame, const float *vp) {
     if (g_built != frame) { g_built = frame; if (!build_tlas(vp)) g_inst.clear(); }
     g_tlas_ms = ms_since(t0);
     if (g_inst.empty() || g_pnodes.empty()) return false;
+    auto tu = Clock::now();
     rtm_blas(g_pnodes.data(), g_pnodes.size(), g_up_nodes, g_ptris.data(), g_ptris.size(), g_up_tris);
     g_up_nodes = g_pnodes.size(); g_up_tris = g_ptris.size();
     rtm_attrs(g_pattr.data(), g_pattr.size(), g_up_attr);
     g_up_attr = g_pattr.size();
     rtm_textures(g_texels.data(), g_texels.size(), g_up_texels, g_texinfo.data(), g_texinfo.size());
     g_up_texels = g_texels.size(); g_up_texinfo = g_texinfo.size();
-    if (g_merged_new && g_merged) {
-        rtm_merged(g_merged->nodes.data(), g_merged->nodes.size(), g_merged->tris.data(), g_merged->tris.size(), g_merged->attr.data(), g_merged->attr.size());
-        g_merged_new = false;
-    }
     g_gi.resize(g_inst.size());
     for (size_t i = 0; i < g_inst.size(); i++) {
         memcpy(g_gi[i].w2o, g_inst[i].iw, 48);
@@ -754,6 +807,7 @@ static bool gpu_frame(uint64_t frame, const float *vp) {
         memcpy(g_gi[i].uvm, in.uvm, 32);
         g_gi[i].tex = in.tex; g_gi[i].pad[0] = g_gi[i].pad[1] = g_gi[i].pad[2] = 0;
     }
+    g_upload_ms = ms_since(tu);
     return true;
 }
 
@@ -778,11 +832,19 @@ unsigned rt_trace_reflect(uint64_t frame, const float *vp, const float *cam, boo
     if (!gpu_frame(frame, vp)) return 0;
     double gpu = 0;
     uint32_t rays[4] = {};
+    auto tt = Clock::now();
     unsigned tex = rtm_trace_reflect(g_gi.data(), g_gi.size(), g_tlas.bvhNode, g_tlas.usedNodes, g_tlas.primIdx, g_inst.size(), cam, g_light, refract, rays, &gpu);
-    double all = ms_since(t0);
+    double trace_ms = ms_since(tt), all = ms_since(t0);
+    g_peak.cap = std::max(g_peak.cap, g_cap_ms); g_peak.tlas = std::max(g_peak.tlas, g_tlas_ms);
+    g_peak.upload = std::max(g_peak.upload, g_upload_ms); g_peak.trace = std::max(g_peak.trace, trace_ms);
+    g_peak.all = std::max(g_peak.all, all + g_cap_ms);
+    g_cap_ms = 0;
     static uint64_t last;
     if (stats_on() && SDL_GetTicks() - last >= 1000) {
         last = SDL_GetTicks();
+        rtlog("rt: worst this second: capture %.1f ms, TLAS %.1f ms, upload %.1f ms, trace (incl. waiting for the GPU) %.1f ms, all %.1f ms",
+              g_peak.cap, g_peak.tlas, g_peak.upload, g_peak.trace, g_peak.all);
+        g_peak = Peaks{};
         rtlog("rt: reflections: %u rays (glass %u, of which %u through a second surface, mean thickness %.3f), Metal %.2f ms (wall %.2f ms incl. TLAS %.2f ms and upload), %zu instances, merged track %u triangles, %zu textures (%.1f MB)",
               rays[0], rays[1], rays[2], rays[2] ? rays[3] / 1000.0 / rays[2] : 0.0, gpu, all, g_tlas_ms, g_inst.size(), g_merged ? g_merged->blas->tris : 0, g_texinfo.size(), g_texels.size() * 4 / 1048576.0);
     }
