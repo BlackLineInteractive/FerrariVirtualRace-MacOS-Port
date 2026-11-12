@@ -905,13 +905,27 @@ float post_temporal_scale();
 void post_taa_jitter(uint64_t frame, float scale, float *jx, float *jy);
 bool post_taa(GLuint col, GLuint dep, GLuint vel, int lw, int lh, GLuint dst, int ow, int oh, float jx, float jy, bool reset);
 
+// The graphics settings in effect (gfx_update): ray tracing, PBR, game reflections, AO, SSR.
+struct Gfx { bool rt, pbr, refl; float ao, ssr; bool init; };
+static Gfx g_gfx;
+static void gfx_update();
+// The scene goes to the port's own targets (taa_bind) for the temporal modes, and at full size
+// for ray tracing, AO or SSR with the other non-multisampled modes (off, FXAA): 0 = not at all.
+int post_msaa_samples();
+static float scene_scale() {
+    float t = post_temporal_scale();
+    if (t > 0) return t;
+    if (!g_gfx.init) gfx_update();
+    if ((g_gfx.rt || g_gfx.ao > 0 || g_gfx.ssr > 0) && post_msaa_samples() == 0) return 1.0f;
+    return 0;
+}
 static bool taa_eligible() {
     if (!D->backbuf || !D->rt[0] || !D->ds || D->rt[1] || D->rt[2] || D->rt[3]) return false;
     Surface *r = D->rt[0];
     if (r == D->backbuf || r->container || is_depth_surf(r) || !r->gl_tex()) return false;
     uint32_t w = D->backbuf->w, h = D->backbuf->h;
     if (r->w != w || r->h != h || D->ds->w != w || D->ds->h != h) return false;
-    return post_temporal_scale() > 0;
+    return scene_scale() > 0;
 }
 static GLuint taa_tex(GLuint t, GLenum ifmt, GLenum fmt, GLenum type, int w, int h) {
     if (!t) glGenTextures(1, &t);
@@ -925,10 +939,11 @@ static GLuint taa_tex(GLuint t, GLenum ifmt, GLenum fmt, GLenum type, int w, int
 static void taa_timer(int point);
 static bool rt_reflections();
 static void taa_bind() {
-    float s = post_temporal_scale();
+    if (!g_gfx.init) gfx_update();
+    float s = scene_scale();
     uint32_t w = D->backbuf->w, h = D->backbuf->h;
     int lw = std::max(1, (int)lroundf(w * s)), lh = std::max(1, (int)lroundf(h * s));
-    if (!D->taa_fbo || lw != D->taa_lw || lh != D->taa_lh) {
+    if (!D->taa_fbo || lw != D->taa_lw || lh != D->taa_lh || (D->taa_m0 != 0) != rt_reflections()) {   // also when ray tracing is switched
         D->taa_col = taa_tex(D->taa_col, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, lw, lh);
         D->taa_vel = taa_tex(D->taa_vel, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, lw, lh);
         D->taa_dep = taa_tex(D->taa_dep, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, lw, lh);
@@ -957,7 +972,8 @@ static void taa_bind() {
     if (D->taa_frame != D->frame) {   // first scene draw of this frame
         D->taa_frame = D->frame;
         taa_timer(0);
-        post_taa_jitter(D->frame, s, &D->taa_jit[0], &D->taa_jit[1]);
+        if (post_temporal_scale() > 0) post_taa_jitter(D->frame, s, &D->taa_jit[0], &D->taa_jit[1]);
+        else D->taa_jit[0] = D->taa_jit[1] = 0;   // no temporal pass: no jitter
     }
     D->taa_rt = D->rt[0];
     D->cur_fbo = D->taa_fbo;
@@ -1043,6 +1059,7 @@ static void vel_setup(Program *p, uint64_t dkey) {
 }
 // End of frame: this frame's draws become the previous ones.
 static void vel_frame_end() {
+    gfx_update();
     D->rt_cam_ok = false; D->rt_cube = 0;
     bool drawn = D->taa_frame == D->frame;
     if (drawn && D->ivp_ok) rt_frame_end(D->frame, D->vp_cur, D->ivp_cur);
@@ -1062,42 +1079,43 @@ GLuint post_ssr(GLuint col, GLuint dep, int w, int h, const float *vp, const flo
 // options.txt as written on the first run (also the reference for the README's settings table).
 static const char *kOptionsTemplate =
     "# Ferrari Virtual Race (macOS port): graphics settings beyond the game's own Video settings menu.\n"
-    "# Lines are name = value; # starts a comment. Each setting can also be set for one run with an\n"
-    "# environment variable FVR_<NAME> (for example FVR_RT=1).\n"
     "#\n"
-    "# ao, ssr and rt need one of the Temporal entries of the in-game Antialias setting.\n"
+    "# Ray tracing, PBR materials, ambient occlusion and screen reflections are also in the game:\n"
+    "# Video settings, below Shadow detail level. Choosing them there writes the lines below.\n"
+    "#\n"
+    "# Remove the # in front of a line to set it here. Each setting can also be given for one run\n"
+    "# as FVR_<NAME> (for example FVR_AO=0.5). ao, ssr and rt need Antialias set to off, FXAA or a\n"
+    "# Temporal entry (not MSAA / FSR 1).\n"
     "\n"
-    "# Ambient occlusion (GTAO): strength, 0 = off. About 5 ms with Temporal 2x at 4K.\n"
-    "ao = 0\n"
+    "# Ambient occlusion (GTAO): strength 0 (off) .. 1. Menu: off 0, low 0.4, medium 0.7, high 1.\n"
+    "#ao = 0.7\n"
     "\n"
-    "# Screen-space reflections on the track: strength, 0 = off. Best with Temporal 1.5x / 2x.\n"
-    "ssr = 0\n"
+    "# Screen-space reflections on the track: strength 0 (off) .. 1. Menu: as ao.\n"
+    "#ssr = 0.7\n"
     "\n"
-    "# Physically based car materials (GGX, clear coat, Fresnel glass): 1 = on.\n"
-    "pbr = 0\n"
+    "# Physically based car materials: 0 / 1.\n"
+    "#pbr = 1\n"
     "\n"
-    "# Ray-traced reflections on car paint, glass and chrome (Metal): 1 = on. Turns on pbr.\n"
-    "rt = 0\n"
+    "# Ray-traced reflections on car paint, glass and chrome: 0 / 1 (turns on pbr).\n"
+    "#rt = 1\n"
     "\n"
-    "# Rays through glass too: 1 = on. The shipped cars' glass has no thickness, so this changes\n"
-    "# nothing for them; it is for car models with real glass.\n"
-    "rt_refract = 0\n"
+    "# Rays through glass too: 0 / 1. The shipped cars' glass has no thickness, so this changes\n"
+    "# nothing for them.\n"
+    "#rt_refract = 1\n"
     "\n"
-    "# The game's own car reflections (a cube map drawn every frame, about half of all draw calls):\n"
-    "# 1 = on, 0 = off. With rt = 1, ray tracing replaces them.\n"
-    "reflections = 1\n"
+    "# The game's own car reflections (a cube map redrawn every frame, about half of all draw calls):\n"
+    "# 1 on, 0 off. With rt = 1 ray tracing gives the car its reflections and the sky.\n"
+    "#reflections = 0\n"
     "\n"
-    "# The track's baked light: 1 = as the game, 0 = even sky light (shading then comes from ao).\n"
-    "baked_light = 1\n"
-    "\n"
-    "# Suggested set for ray tracing (with Antialias = Temporal 2x):\n"
-    "#   ao = 0.8, rt = 1, reflections = 0\n";
+    "# The track's baked light: 1 as the game .. 0 even sky light (the shading then comes from ao).\n"
+    "#baked_light = 0.5\n";
 
-static float fvr_option(const char *name, float def) {
+static std::map<std::string, float> g_opts;
+float fvr_option(const char *name, float def) {
     std::string env = "FVR_" + std::string(name);
     for (char &ch : env) ch = (char)toupper((unsigned char)ch);
     if (const char *e = getenv(env.c_str())) return (float)atof(e);
-    static std::map<std::string, float> opts; static bool loaded;
+    std::map<std::string, float> &opts = g_opts; static bool loaded;
     if (!loaded) {
         loaded = true;
         std::string path = g_user_dir + "/options.txt";
@@ -1119,15 +1137,57 @@ static float fvr_option(const char *name, float def) {
     auto it = opts.find(name);
     return it != opts.end() ? it->second : def;
 }
+// Sets an option (from the Video settings menu): in effect at once, and kept in options.txt, where
+// the setting's line (commented out or not) becomes "name = value"; the comments stay.
+void fvr_option_set(const char *name, float value) {
+    fvr_option(name, 0);   // loaded
+    g_opts[name] = value;
+    std::string path = g_user_dir + "/options.txt";
+    std::vector<std::string> lines;
+    if (FILE *f = fopen(path.c_str(), "r")) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) lines.push_back(line);
+        fclose(f);
+    }
+    char buf[96];
+    snprintf(buf, sizeof buf, "%s = %g\n", name, value);
+    bool done = false;
+    for (auto &l : lines) {
+        size_t p = l.find_first_not_of(" \t#");
+        if (p == std::string::npos || l.compare(p, strlen(name), name) != 0) continue;
+        size_t q = l.find_first_not_of(" \t", p + strlen(name));
+        if (q == std::string::npos || l[q] != '=') continue;
+        if (!done) { l = buf; done = true; }
+    }
+    if (!done) lines.push_back(buf);
+    if (FILE *f = fopen(path.c_str(), "w")) { for (auto &l : lines) fputs(l.c_str(), f); fclose(f); }
+}
 // Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 traces reflections on mirror-like car surfaces;
 // rt_view=1/2 traces primary rays and shows them instead of the game's image (a check).
 GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint tcol, GLuint cube, const float *vp, const float *ivp, const float *cam);
-// rt=1: ray-traced reflections on the mirror-like car surfaces (PBR material, implies pbr=1)
-static bool rt_reflections() { static bool on = fvr_option("rt", 0) > 0; return on; }
+// The graphics settings in effect (options.txt, also set from the Video settings menu), updated
+// every frame so that a change takes effect at once.
+static void gfx_update() {
+    Gfx g;
+    g.rt = fvr_option("rt", 0) > 0;
+    g.pbr = fvr_option("pbr", 0) > 0 || g.rt;
+    g.refl = fvr_option("reflections", 1) > 0;
+    g.ao = fvr_option("ao", 0);
+    g.ssr = fvr_option("ssr", 0);
+    g.init = true;
+    if (!g_gfx.init || g.pbr != g_gfx.pbr || g.rt != g_gfx.rt) {   // the car material changes: relink programs
+        pbr_configure(g.pbr, g.rt);
+        if (D) { D->sm_progs.clear(); D->last_prog = nullptr; }
+        if (g_gfx.init) rtlog("d3d9: graphics: pbr %d, ray tracing %d, ao %.2f, ssr %.2f, game reflections %d", g.pbr, g.rt, g.ao, g.ssr, g.refl);
+    }
+    g_gfx = g;
+}
+// rt: ray-traced reflections on the mirror-like car surfaces (PBR material, implies pbr)
+static bool rt_reflections() { return g_gfx.rt; }
 // rt_refract=1: also trace through glass (only glass with a thickness bends the view)
 static bool rt_refract() { static bool on = fvr_option("rt_refract", 0) > 0; return on; }
 static int rt_view_mode() { static int v = (int)fvr_option("rt_view", 0); return v; }
-static bool rt_enabled() { static bool on = fvr_option("rt", 0) > 0 || rt_view_mode() > 0; return on; }
+static bool rt_enabled() { return g_gfx.rt || rt_view_mode() > 0; }
 // Copies the ray-traced image (rectangle texture, w x h) over the scene colour (lw x lh).
 static void rt_show(GLuint rect, int w, int h, GLuint col, int lw, int lh) {
     static GLuint rf, df;
@@ -1154,9 +1214,9 @@ static void taa_resolve(Surface *dst) {
         if (mat4_inv(D->vp_cur, ivp2))
             if (GLuint hit = rt_trace_reflect(D->frame, D->vp_cur, D->rt_cam, rt_refract()))
                 col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, rtm_hit_colour(), rtm_glass(),
-                              fvr_option("reflections", 1) > 0 ? D->rt_cube : 0, D->vp_cur, ivp2, D->rt_cam);
+                              g_gfx.refl ? D->rt_cube : 0, D->vp_cur, ivp2, D->rt_cam);
     }
-    static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
+    float ssr = g_gfx.ssr, ao = g_gfx.ao;
     float ivp[16];
     if ((ssr > 0 || ao > 0) && D->vp_cur_ok && mat4_inv(D->vp_cur, ivp)) {
         // camera position: the point the projection maps to w = 0 at the image centre
@@ -1167,7 +1227,20 @@ static void taa_resolve(Surface *dst) {
         if (ssr > 0) col = post_ssr(col, D->taa_dep, D->taa_lw, D->taa_lh, D->vp_cur, ivp, cam, ssr, D->frame);
     }
     taa_timer(2);
-    post_taa(col, D->taa_dep, D->taa_vel, D->taa_lw, D->taa_lh, dst->gl_tex(), dst->w, dst->h, D->taa_jit[0], D->taa_jit[1], reset);
+    if (post_temporal_scale() > 0)
+        post_taa(col, D->taa_dep, D->taa_vel, D->taa_lw, D->taa_lh, dst->gl_tex(), dst->w, dst->h, D->taa_jit[0], D->taa_jit[1], reset);
+    else {   // full-size scene without the temporal pass: copy it where the game expects it
+        static GLuint rf, df;
+        if (!rf) { glGenFramebuffers(1, &rf); glGenFramebuffers(1, &df); }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, rf);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, col, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, df);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst->gl_tex(), 0);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(1, 1, 1, 1);
+        glBlitFramebuffer(0, 0, D->taa_lw, D->taa_lh, 0, 0, dst->w, dst->h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
     taa_timer(3);
     D->taa_have = true;
     D->taa_last = D->frame;
@@ -1440,7 +1513,7 @@ static Program *get_program(Decl *decl) {
     if (!vs || !ps) return get_program_slow(decl, vs, ps, ps ? shadow_mask(ps) : 0);   // fixed-function parts depend on render state
     uint16_t mask = shadow_mask(ps);
     static bool novel = getenv("FVR_TAA_NOVEL") != nullptr;   // benchmark: temporal targets without motion vectors
-    bool vel = D->taa_bound && ps->sm.color_outputs == 1 && !novel;
+    bool vel = D->taa_bound && ps->sm.color_outputs == 1 && !novel && post_temporal_scale() > 0;
     if (D->last_prog && D->last_vs == vs->uid && D->last_ps == ps->uid && D->last_mask == mask && D->last_vel == vel) return D->last_prog;
     uint64_t k = prog_key(vs, ps, mask, vel);
     auto it = D->sm_progs.find(k);
@@ -1460,7 +1533,7 @@ static Program *get_program(Decl *decl) {
 static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t mask, bool vel) {
     DevState &st = D->st;
     vel = vel && vs && ps;
-    std::string key = std::to_string(vs ? vs->uid : 0) + "/" + std::to_string(ps ? ps->uid : 0) + "#" + std::to_string(mask) + (vel ? "v" : "");
+    std::string key = std::to_string(vs ? vs->uid : 0) + "/" + std::to_string(ps ? ps->uid : 0) + "#" + std::to_string(mask) + (vel ? "v" : "") + (g_gfx.pbr ? (g_gfx.rt ? "|pr" : "|p") : "");
     std::string vsrc, psrc, k1, k2;
     SmShader ffps_if, ffvs_if;
     if (!vs) {
@@ -1479,7 +1552,8 @@ static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t ma
     if (ps) {
         ffvs_if = ff_vs_iface(decl, st);
         // pbr=1: the car material's main() is replaced (pbr.cpp)
-        static bool pbr_on = (pbr_configure(fvr_option("pbr", 0) > 0 || rt_reflections(), rt_reflections()), fvr_option("pbr", 0) > 0 || rt_reflections());
+        if (!g_gfx.init) gfx_update();
+        bool pbr_on = g_gfx.pbr;
         SmShader alt;
         const SmShader *src = &ps->sm;
         pbr_replaced = false;
@@ -1990,6 +2064,11 @@ static Program *prepare_draw(uint64_t dkey = 0) {
         int want = p->vel && !D->st.rs[27];
         if (want != D->vel_mask) { glColorMaski(1, want, want, want, want); D->vel_mask = want; }
         if (p->vel) vel_setup(p, dkey);
+        else if (D->st.vs && D->st.vs->uses_vp && !D->vp_cur_ok) {   // no motion vectors: still the camera
+            memcpy(D->vp_cur, D->st.vsf[16], 64);
+            D->vp_cur_ok = true;
+            D->ivp_ok = mat4_inv(D->vp_cur, D->ivp_cur);
+        }
         if (D->taa_m0) {   // reflection mask: written only by the PBR car material, never blended
             int want = p->rtmask;
             if (want != D->rtm_state) { glColorMaski(2, want, want, want, want); glColorMaski(3, want, want, want, want); D->rtm_state = want; }
@@ -2717,7 +2796,7 @@ M(dev_GetNPatchMode) { RETN(1, 0); }
 // into cube-map faces (about half of a race frame's draws) and their clears are black, so the car
 // paint, windows and water reflect nothing until ray-traced or screen-space reflections replace them.
 static bool cube_skip() {
-    static bool off = fvr_option("reflections", 1) <= 0;
+    bool off = !g_gfx.refl;
     Surface *r = D->rt[0];
     return off && r && r->container && r->container->target == GL_TEXTURE_CUBE_MAP;
 }

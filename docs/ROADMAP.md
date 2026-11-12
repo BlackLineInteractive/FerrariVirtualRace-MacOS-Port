@@ -9,6 +9,7 @@
 - Screen-space reflections on the track surface and ground-truth ambient occlusion (GTAO), both optional in `options.txt`
 - Options to turn off the game's own cube-map reflections (half of the draw calls) and its baked track lighting
 - `options.txt` written with every setting and its explanation on the first launch
+- Ray tracing, PBR materials, ambient occlusion and screen reflections as entries of the game's own *Video settings* menu (added through the menu's own functions), taking effect at once; RT / AO / SSR also without the temporal modes
 - Physically based car materials from the game's own material data (`pbr`)
 - Ray-traced reflections (`rt`): Metal compute next to OpenGL, rays only on mirror-like pixels (clear coat, glass, chrome), hits shaded with textures, the sun with shadow rays and the game's ambient light; glass refraction for models that have glass thickness (`rt_refract`)
 - Resolutions up to 4K and the native Retina size

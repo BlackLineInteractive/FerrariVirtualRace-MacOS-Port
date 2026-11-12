@@ -43,35 +43,28 @@ The port adds to the game's own *Video settings* menu:
 | **Antialias** | `FXAA` (post filter), `MSAA 2x / 4x / 8x` (real multisampling of the HDR scene, alpha-to-coverage for alpha-tested foliage), `FSR 1` (MSAA 4x + AMD FidelityFX Super Resolution 1 upscaling to the Retina pixel size and RCAS sharpening), `Temporal AA`, `Temporal 1.5x`, `Temporal 2x` (see below) |
 | **Resolution / Window size** | Every common size up to 2560x1440 (2K), 3840x2160 (4K) and the display's native Retina resolution. Sizes larger than the screen are scaled down to fit, which works as supersampling |
 | **Shadow detail** | Hardware shadow maps (depth-compare PCF) like the original Windows drivers |
+| **Ray tracing** *(new)* | `off` / `on`: ray-traced reflections on car paint, glass and chrome (see below) |
+| **PBR materials** *(new)* | `off` / `on`: physically based car materials |
+| **Ambient occlusion** *(new)* | `off` / `low` / `medium` / `high` (GTAO) |
+| **Screen reflections** *(new)* | `off` / `low` / `medium` / `high`: reflections on the track |
 
-Changing video settings recreates the device in-game; the port keeps running.
+Changing video settings recreates the device in-game; the port keeps running. The four new entries are added to the game's own menu by the port and take effect at once. Ray tracing, ambient occlusion and screen reflections work with *Antialias* set to `off`, `FXAA` or one of the `Temporal` entries (not with MSAA or FSR 1, which draw the scene multisampled); the `Temporal` entries also smooth their per-frame noise.
 
 ### More settings: options.txt
 
-Everything the game's menu has no place for is in `~/Library/Application Support/FerrariVirtualRace/options.txt`. The first launch writes it with every setting at its default and a comment explaining it; edit it with any text editor while the game is closed. Each setting can also be given for one run as an environment variable `FVR_<NAME>` (for example `FVR_RT=1`).
+The same settings and a few more are in `~/Library/Application Support/FerrariVirtualRace/options.txt`. The first launch writes it with every setting commented out and explained; the menu entries above write their lines there. Edit it with any text editor while the game is closed. Each setting can also be given for one run as an environment variable `FVR_<NAME>` (for example `FVR_RT=1`).
 
 | Setting | Values | What it does | Needs | Cost (Radeon Pro 5500M) |
 | --- | --- | --- | --- | --- |
-| `ao` | 0 (off) .. 1 | Ground-truth ambient occlusion (GTAO) | a `Temporal` mode | ~5 ms with `Temporal 2x` at 4K |
-| `ssr` | 0 (off) .. 1 | Screen-space reflections on the track | a `Temporal` mode | ~4 ms with `Temporal 2x` at 4K |
+| `ao` | 0 (off) .. 1 | Ground-truth ambient occlusion (GTAO) | *Antialias* off / FXAA / Temporal | ~5 ms with `Temporal 2x` at 4K |
+| `ssr` | 0 (off) .. 1 | Screen-space reflections on the track | *Antialias* off / FXAA / Temporal | ~4 ms with `Temporal 2x` at 4K |
 | `pbr` | 0 / 1 | Physically based car materials | - | negligible |
-| `rt` | 0 / 1 | Ray-traced reflections on car paint, glass and chrome (Metal) | a `Temporal` mode; turns on `pbr` | see below |
+| `rt` | 0 / 1 | Ray-traced reflections on car paint, glass and chrome (Metal) | *Antialias* off / FXAA / Temporal; turns on `pbr` | see below |
 | `rt_refract` | 0 / 1 | Rays through glass as well | `rt` | ~1 ms; no visible change on the shipped cars |
 | `reflections` | 1 / 0 | The game's own car reflections (a cube map redrawn every frame) | - | 0 removes about half of all draw calls |
 | `baked_light` | 1 .. 0 | The track's baked light; towards 0 it becomes even sky light and `ao` does the shading | - | none |
 
-Suggested sets, with *Antialias* at `Temporal 2x`:
-
-```text
-# image quality, ray tracing
-ao = 0.8
-rt = 1
-reflections = 0
-
-# frame rate
-ao = 0.8
-reflections = 0
-```
+Suggested: *Antialias* `Temporal 2x`, *Ray tracing* on, *Ambient occlusion* medium; for frame rate also `reflections = 0` in `options.txt` (ray tracing then gives the car its reflections and the sky, with half the draw calls).
 
 ### Temporal AA and upscaling
 
@@ -100,13 +93,13 @@ A game from 2009 with ray-traced reflections: the port records every draw of the
 
 **The scene.** Each distinct mesh becomes a [tinybvh](third_party/tiny_bvh.h) CWBVH (BVH8), built when it is first drawn; a deformed car body is rebuilt in the background. The game only draws what is in view, so the track is remembered after it leaves the view and merged, in a background thread, into one world-space CWBVH (about 540,000 triangles at Mugello); a top-level BVH over that and this frame's cars is rebuilt every frame (about 0.5 ms). The traversal follows the CWBVH / TLAS walk of an existing Metal path tracer.
 
-**Materials** (`pbr`). The game shades all car parts with one shader whose constants come from the car's `.MTL` files. The port turns them into a physically based material: GGX specular with Schlick Fresnel, roughness from the material's gloss exponent, reflectivity from the game's own Fresnel setting (chrome becomes metallic), an energy-conserving clear coat on paint and Fresnel-dependent transparency on glass. The paint looks a little less saturated than the original, because a real clear coat reflects about 4% of the sky even head-on. Untextured and plain textured parts are converted; parts with decals, gloss masks or two textures keep the original shader.
+**Materials** (*PBR materials* in the menu, `pbr`). The game shades all car parts with one shader whose constants come from the car's `.MTL` files. The port turns them into a physically based material: GGX specular with Schlick Fresnel, roughness from the material's gloss exponent, reflectivity from the game's own Fresnel setting (chrome becomes metallic), an energy-conserving clear coat on paint and Fresnel-dependent transparency on glass. The paint looks a little less saturated than the original, because a real clear coat reflects about 4% of the sky even head-on. Untextured and plain textured parts are converted; parts with decals, gloss masks or two textures keep the original shader.
 
-**Reflections** (`rt`). Whitted rays only suit mirror-like surfaces, so they are traced only there: the PBR shader marks clear-coated paint, glass and chrome (GGX alpha up to 0.15) in two extra render targets that Metal reads through IOSurfaces, and Metal traces one ray for each of those pixels, about 20,000-40,000 per frame at 960x540 (4-7% of the image). A hit visible on screen takes its colour from the frame itself; any other hit is shaded in Metal the way the game shades it: the diffuse texture at the hit (every texture is kept as a copy of at most 128x128 when the game loads it), the sun with a shadow ray, the track's baked light or the cars' hemisphere light. Rays that miss take the sky from the game's cube map, or from Metal's sky when `reflections = 0`.
+**Reflections** (*Ray tracing* in the menu, `rt`). Whitted rays only suit mirror-like surfaces, so they are traced only there: the PBR shader marks clear-coated paint, glass and chrome (GGX alpha up to 0.15) in two extra render targets that Metal reads through IOSurfaces, and Metal traces one ray for each of those pixels, about 20,000-40,000 per frame at 960x540 with `Temporal 2x` (4-7% of the image), about 100,000 at 1920x1080 without a temporal mode. Whitted rays need no temporal accumulation: with *Antialias* off or FXAA the scene is drawn into the port's own full-size targets and each pixel gets its one ray. A hit visible on screen takes its colour from the frame itself; any other hit is shaded in Metal the way the game shades it: the diffuse texture at the hit (every texture is kept as a copy of at most 128x128 when the game loads it), the sun with a shadow ray, the track's baked light or the cars' hemisphere light. Rays that miss take the sky from the game's cube map, or from Metal's sky when `reflections = 0`.
 
 **Glass** (`rt_refract`). Glass reflects through the same rays. Refraction is traced as well (index 1.5, refracting at every glass surface, total internal reflection), but every glass part of the shipped cars, lamp covers included, is a single sheet without thickness, so light leaves it as it came and nothing bends; it is there for car models with real glass.
 
-**Cost.** The rays themselves take 1-2.5 ms of GPU time. What costs frame rate is synchronisation: OpenGL has to finish the scene before Metal can read the mask, and the frame waits for Metal before it can go on, so the CPU and GPU no longer overlap. On a Radeon Pro 5500M a race runs at about 55-60 fps with `rt = 1` against about 100 without (`Temporal 2x`, 1080p). An asynchronous hand-over with a frame of latency, and later the planned Metal renderer, remove most of that.
+**Cost.** The rays themselves take 1-2.5 ms of GPU time at 960x540. What costs frame rate is synchronisation: OpenGL has to finish the scene before Metal can read the mask, and the frame waits for Metal before it can go on, so the CPU and GPU no longer overlap. On a Radeon Pro 5500M a race runs at about 55-60 fps with `rt = 1` against about 100 without (`Temporal 2x`, 1080p). An asynchronous hand-over with a frame of latency, and later the planned Metal renderer, remove most of that.
 
 **Not in the reflections yet:** instanced trees, camera-facing tree billboards, grass, debris and the alpha masks of fences.
 
