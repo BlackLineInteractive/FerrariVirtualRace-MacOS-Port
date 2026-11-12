@@ -7,6 +7,7 @@
 #include <OpenGL/OpenGL.h>
 #include "win32ui.h"
 #include "rt_scene.h"
+#include "pbr.h"
 #include <mutex>
 #include <unordered_map>
 #include <set>
@@ -1390,7 +1391,18 @@ static Program *get_program_slow(Decl *decl, Shader *vs, Shader *ps, uint16_t ma
     auto it = D->progs.find(key);
     if (it != D->progs.end()) return &it->second;
     if (vs) { ffps_if = ff_ps_iface(); vsrc = sm_vs_source(vs->sm, ps ? &ps->sm : &ffps_if, vel); }
-    if (ps) { ffvs_if = ff_vs_iface(decl, st); psrc = sm_ps_source(ps->sm, vs ? &vs->sm : &ffvs_if, mask, vel); }
+    if (ps) {
+        ffvs_if = ff_vs_iface(decl, st);
+        // pbr=1: the car material's main() is replaced (pbr.cpp)
+        static bool pbr_on = (pbr_configure(fvr_option("pbr", 0) > 0), fvr_option("pbr", 0) > 0);
+        SmShader alt;
+        const SmShader *src = &ps->sm;
+        if (pbr_on) {
+            std::string funcs = ps->sm.funcs, body;
+            if (pbr_car_shader(ps->hash, funcs, body)) { alt = ps->sm; alt.funcs = funcs; alt.body = body; src = &alt; }
+        }
+        psrc = sm_ps_source(*src, vs ? &vs->sm : &ffvs_if, mask, vel);
+    }
     Program &p = D->progs[key];
     p.vs = vs; p.ps = ps; p.ff_vs = !vs; p.ff_ps = !ps; p.shadow_mask = mask; p.vel = vel;
     GLuint a = compile_shader(GL_VERTEX_SHADER, vsrc), b = compile_shader(GL_FRAGMENT_SHADER, psrc);

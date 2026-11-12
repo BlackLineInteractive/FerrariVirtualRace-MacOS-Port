@@ -68,6 +68,10 @@ ssr=0.8
 
 **Reflections**: the track surface reflects the cars, buildings and sky at grazing angles. The game has no material data, so it is applied to near-horizontal surfaces that are not grass. Reflections cost about 4 ms with `Temporal 2x` at 4K and much more at native 4K, so use them with `Temporal 1.5x` or `Temporal 2x`.
 
+### Physically based car materials
+
+`pbr=1` in `options.txt` (or `FVR_PBR=1`) replaces the game's car material with a physically based one, built from the same material constants the game reads from the car's `.MTL` files: GGX specular with Schlick Fresnel, roughness from the material's gloss exponent, reflectivity from the game's own Fresnel setting (chrome becomes metallic), an energy-conserving clear coat on paint and Fresnel-dependent transparency on glass. Reflections still come from the game's cube map; it prepares the materials for ray-traced reflections. The paint looks slightly less saturated than the original, because a real clear coat reflects about 4% of the sky even head-on. Untextured and plain textured parts are converted so far; parts with decals, gloss masks or two textures keep the original shader.
+
 ### The game's own reflections and baked light
 
 Two more `options.txt` settings take out what the game bakes in, so that ambient occlusion now, and ray tracing later, do that work instead:
