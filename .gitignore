@@ -1,0 +1,31 @@
+# Build outputs and generated C sources
+/build/
+/gen/
+*.o
+*.dSYM/
+*.app/
+
+# Ghidra local project workspace (ExportFuncs.java and funcs_hi.jsonl are tracked)
+/ghidra/*.gpr
+/ghidra/*.rep/
+
+# Python environment and cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Proprietary game binaries (not part of this repository)
+*.exe
+*.dll
+
+# Logs and debug frame dumps
+*.log
+*.ppm
+
+# macOS and editor artifacts
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
