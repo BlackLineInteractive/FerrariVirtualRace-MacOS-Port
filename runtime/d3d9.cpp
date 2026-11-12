@@ -385,8 +385,23 @@ static uint32_t lock_level(Texture *t, int face, uint32_t l, uint32_t rect, uint
     return p;
 }
 
+static bool rt_enabled();
 static void unlock_level(Texture *t, int face, uint32_t l) {
     upload_level(t, face, l);
+    // ray tracing: keep a small copy for shading reflection hits before the guest copy goes
+    // (the largest level of at most 128 pixels, or the smallest there is)
+    uint32_t mm = t->mem[face * t->levels + l];
+    if (mm && face == 0 && t->kind == K_TEX && !(t->usage & 1) && rt_enabled()) {
+        uint32_t lw = mip_dim(t->w, l), lh = mip_dim(t->h, l);
+        bool fits = std::max(lw, lh) <= 128, prev_big = l == 0 || std::max(mip_dim(t->w, l - 1), mip_dim(t->h, l - 1)) > 128;
+        if ((fits && prev_big) || ((l + 1 == t->levels || (t->autogen && l == 0)) && t->rt_tex < 0)) {
+            static uint64_t serial;
+            RtTexSrc src;
+            src.fmt = t->fmt; src.w = lw; src.h = lh; src.pitch = fmt_pitch(fmt_info(t->fmt), lw);
+            src.data = H(mm); src.key = ++serial;
+            t->rt_tex = rt_texture(src);
+        }
+    }
     // Keep the CPU copy only where D3D would (dynamic / sysmem); otherwise free it to save guest memory.
     uint32_t &m = t->mem[face * t->levels + l];
     if (m && !t->sysmem() && !(t->usage & 0x200)) { gfree(m); m = 0; }
@@ -1065,7 +1080,7 @@ static float fvr_option(const char *name, float def) {
 }
 // Ray tracing (rt_scene.cpp, rt_metal.mm): rt=1 keeps the scene's acceleration structures;
 // rt_view=1 also traces it on the GPU and shows that instead of the game's image (a check).
-GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint cube, const float *vp, const float *ivp, const float *cam);
+GLuint post_rt(GLuint col, GLuint dep, int w, int h, GLuint m0, GLuint m1, GLuint hit, GLuint hcol, GLuint cube, const float *vp, const float *ivp, const float *cam);
 // rt=1: ray-traced reflections on the mirror-like car surfaces (PBR material, implies pbr=1)
 static bool rt_reflections() { static bool on = fvr_option("rt", 0) > 0; return on; }
 static int rt_view_mode() { static int v = (int)fvr_option("rt_view", 0); return v; }
@@ -1095,7 +1110,7 @@ static void taa_resolve(Surface *dst) {
         float ivp2[16];
         if (mat4_inv(D->vp_cur, ivp2))
             if (GLuint hit = rt_trace_reflect(D->frame, D->vp_cur, D->rt_cam))
-                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, D->rt_cube, D->vp_cur, ivp2, D->rt_cam);
+                col = post_rt(col, D->taa_dep, D->taa_lw, D->taa_lh, D->taa_m0, D->taa_m1, hit, rtm_hit_colour(), D->rt_cube, D->vp_cur, ivp2, D->rt_cam);
     }
     static float ssr = fvr_option("ssr", 0), ao = fvr_option("ao", 0);
     float ivp[16];
@@ -1805,6 +1820,42 @@ static std::string rt_shader_name(Shader *vs) {
     for (auto &k : vs->ctab) { if (!n.empty()) n += ' '; n += k.first; }
     return n.empty() ? "no CTAB" : n;
 }
+// The draw's material for shading reflection hits: TEXCOORD0 and COLOR1 (baked light) streams,
+// the diffuse texture on sampler 0, the car material colour (DiffColor) and the track's texture
+// matrix (TexMat1); also the light the hits are shaded with.
+static void rt_material(RtDraw &d, Decl *decl) {
+    d.tex = -1; d.kind = 0;
+    d.color[0] = d.color[1] = d.color[2] = d.color[3] = 1;
+    Shader *vs = D->st.vs, *ps = D->st.ps;
+    for (auto &e : decl->el) {
+        if (e.stream >= 16) continue;
+        StreamSrc &s = D->st.streams[e.stream];
+        if (!s.vb || !s.vb->mem || !s.stride) continue;
+        uint32_t off = s.offset + e.offset;
+        if (off >= s.vb->size) continue;
+        if (e.usage == 5 && e.index == 0 && (e.type == 1 || e.type == 2 || e.type == 3)) {
+            d.uv = H(s.vb->mem) + off; d.uv_stride = s.stride; d.uv_size = s.vb->size - off; d.uv_id = s.vb->mem + off; d.uv_type = e.type;
+        }
+        if (e.usage == 10 && e.index == 1 && e.type == 4 && vs && vs->ctab.count("AmbLevel")) {
+            d.col = H(s.vb->mem) + off; d.col_stride = s.stride; d.col_size = s.vb->size - off; d.col_id = s.vb->mem + off;
+        }
+    }
+    const float (*pc)[4] = D->st.psf;
+    if (ps && ps->ctab.count("DiffColor")) {
+        d.kind = 1;
+        memcpy(d.color, pc[0], 16);
+        rt_lighting(pc[16], pc[17], pc[10], pc[11], 0);
+    }
+    if (vs && vs->ctab.count("AmbLevel")) rt_lighting(nullptr, nullptr, nullptr, nullptr, D->st.vsf[37][3]);
+    int tm = vs ? vs->ctab_reg("TexMat1") : -1;
+    if (tm >= 0 && tm + 1 < 256) {
+        memcpy(d.uvm, D->st.vsf[tm], 16); memcpy(d.uvm + 4, D->st.vsf[tm + 1], 16); d.has_uvm = true;
+    }
+    if (ps && (ps->ctab.count("DiffuseTex1") || ps->ctab.count("BodyTex_"))) {
+        Texture *t = (Texture *)D->st.tex[0];
+        if (t && t->kind == K_TEX) d.tex = t->rt_tex;
+    }
+}
 static void rt_note(int prim, uint32_t prims, uint32_t first, int32_t base, Buffer *ib, int inst) {
     if (!D->taa_bound || !rt_capture_active(D->frame, rt_enabled())) return;
     if (inst > 1) { rt_skip(RT_SKIP_INSTANCED); return; }
@@ -1827,6 +1878,7 @@ static void rt_note(int prim, uint32_t prims, uint32_t first, int32_t base, Buff
     if (ni == names.end()) ni = names.emplace(D->st.vs, rt_shader_name(D->st.vs)).first;
     d.shader = ni->second.c_str();
     d.vb_id = st.vb->mem + off; d.vb_ver = st.vb->ver; d.ib_id = ib ? ib->mem : 0; d.ib_ver = ib ? ib->ver : 0;
+    rt_material(d, decl);
     rt_capture(d);
 }
 

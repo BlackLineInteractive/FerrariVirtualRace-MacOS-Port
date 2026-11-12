@@ -25,7 +25,32 @@ struct RtDraw {
     uint32_t ib_id, ib_ver;
     const char *shader;          // vertex shader's constant names (statistics)
     bool fixed;                  // world-space track geometry: cannot move
+    // material (for shading reflection hits)
+    const uint8_t *uv;           // TEXCOORD0 of vertex 0 (null: none)
+    uint32_t uv_stride, uv_size, uv_id;
+    uint8_t uv_type;             // D3DDECLTYPE: 1 FLOAT2, 2 FLOAT3, 3 FLOAT4
+    const uint8_t *col;          // COLOR1 (baked light, D3DCOLOR) of vertex 0 (null: none)
+    uint32_t col_stride, col_size, col_id;
+    int tex;                     // rt_texture() id of the diffuse texture, -1 none
+    float color[4];              // material colour (the car's DiffColor; white for the track)
+    float uvm[8];                // texture matrix rows (u = dot(row0.xyz, (u, v, 1)), v = row1)
+    bool has_uvm;
+    int kind;                    // 0 track (baked light), 1 car material (hemisphere ambient)
 };
+
+// A diffuse texture as the game keeps it in memory: one mip level, D3DFMT (A8R8G8B8, X8R8G8B8,
+// DXT1/3/5), rows `pitch` bytes apart (blocks of 4 rows for DXT).
+struct RtTexSrc {
+    uint64_t key;                // identifies the texture (guest address, size, format)
+    uint32_t fmt, w, h, pitch;
+    const uint8_t *data;
+};
+// Id of the texture in the ray tracer's texture store (decoded to at most 128x128 RGBA8 the first
+// time), -1 for formats it does not read.
+int rt_texture(const RtTexSrc &t);
+// Lighting the hits are shaded with: sun direction (to the sun) and colour, the cars' hemisphere
+// ambient (below / above) and the track's ambient level (AmbLevel).
+void rt_lighting(const float *sun_dir, const float *sun_col, const float *amb_lo, const float *amb_hi, float amb_level);
 
 // Why a draw was left out (statistics).
 enum RtSkip { RT_SKIP_SHADER, RT_SKIP_INSTANCED, RT_SKIP_UP, RT_SKIP_FORMAT, RT_SKIP_PRIM, RT_SKIP_VOLATILE,

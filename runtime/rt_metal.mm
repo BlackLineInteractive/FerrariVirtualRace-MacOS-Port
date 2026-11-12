@@ -15,7 +15,10 @@ static const char *kSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-struct Inst { float4 r0, r1, r2; uint nodeBase, triBase, tint, pad; };
+struct Inst { float4 r0, r1, r2; uint nodeBase, triBase, attrBase, flags; float4 color, uvm0, uvm1; int tex; uint pad0, pad1, pad2; };
+struct TriAttr { float2 uv0, uv1, uv2; uint c0, c1, c2; uint tex; };
+struct TexInfo { uint off, w, h, pad; };
+struct Light { float4 sunDir, sunCol, ambLo, ambHi; float ambLevel, p0, p1, p2; };
 struct TNode { float4 mn; float4 mx; };          // .w: leftFirst / triCount (uint bits)
 struct Params { float4 ivp[4]; uint w, h, nInst, mode; };   // mode 2: look backwards
 
@@ -44,10 +47,10 @@ inline uint cwTestQuad(uint meta4, uint loxSource, uint hixSource, uint loySourc
     return accepted.x | accepted.y | accepted.z | accepted.w;
 }
 
-struct Hit { float t; float3 n; uint inst; };    // n: object-space geometric normal (unnormalised)
+struct Hit { float t; float3 n; uint inst, prim; float u, v; };    // n: object-space geometric normal (unnormalised)
 
 bool intersectBlas(device const float4 *nodes, device const float4 *tris, uint nodeBase, uint triBase,
-                   float3 O, float3 D, float3 rD, float tMin, thread float &tMax, thread Hit &hit, uint instance) {
+                   float3 O, float3 D, float3 rD, float tMin, thread float &tMax, thread Hit &hit, uint instance, bool anyHit) {
     uint stack[kCwStack];
     uint sp = 0;
     bool found = false;
@@ -103,8 +106,9 @@ bool intersectBlas(device const float4 *nodes, device const float4 *tris, uint n
             const float t = f * dot(e2, q);
             if (t <= tMin || t >= tMax) continue;
             tMax = t;
-            hit.t = t; hit.n = cross(e1, e2); hit.inst = instance;
+            hit.t = t; hit.n = cross(e1, e2); hit.inst = instance; hit.prim = as_type<uint>(v0.w) & 0x7FFFFFFFu; hit.u = u; hit.v = v;
             found = true;
+            if (anyHit) return true;
         }
         if (ngroup.y > 0x00FFFFFFu) continue;
         if (sp == 0u) break;
@@ -115,7 +119,8 @@ bool intersectBlas(device const float4 *nodes, device const float4 *tris, uint n
 }
 
 bool traceTlas(device const float4 *nodes, device const float4 *tris, device const float4 *mnodes, device const float4 *mtris,
-               device const TNode *tlas, device const uint *prims, device const Inst *insts, float3 origin, float3 direction, float tMin, thread float &tMax, thread Hit &hit) {
+               device const TNode *tlas, device const uint *prims, device const Inst *insts, float3 origin, float3 direction, float tMin, thread float &tMax, thread Hit &hit,
+               bool anyHit = false) {
     const float3 rD = 1.0f / select(direction, float3(1e-20f), abs(direction) < 1e-20f);
     uint stack[kTlasStack];
     uint sp = 0, nodeIdx = 0;
@@ -132,8 +137,11 @@ bool traceTlas(device const float4 *nodes, device const float4 *tris, device con
                 const float3 O = float3(dot(in.r0, o4), dot(in.r1, o4), dot(in.r2, o4));
                 const float3 D = float3(dot(in.r0, d4), dot(in.r1, d4), dot(in.r2, d4));
                 const float3 iD = 1.0f / select(D, float3(1e-20f), abs(D) < 1e-20f);
-                if (in.pad ? intersectBlas(mnodes, mtris, 0u, 0u, O, D, iD, tMin, tMax, hit, ii)
-                           : intersectBlas(nodes, tris, in.nodeBase, in.triBase, O, D, iD, tMin, tMax, hit, ii)) found = true;
+                if ((in.flags & 1u) ? intersectBlas(mnodes, mtris, 0u, 0u, O, D, iD, tMin, tMax, hit, ii, anyHit)
+                                    : intersectBlas(nodes, tris, in.nodeBase, in.triBase, O, D, iD, tMin, tMax, hit, ii, anyHit)) {
+                    found = true;
+                    if (anyHit) return true;
+                }
             }
         } else {
             const uint childA = leftFirst, childB = leftFirst + 1u;
@@ -164,13 +172,42 @@ bool traceTlas(device const float4 *nodes, device const float4 *tris, device con
 // m0 = (reflection direction, GGX alpha), m1 = (position - camera, weight; 0 = no ray).
 // out = (hit position, 1) for a hit, (0, 0, 0, 2) for a miss (sky), 0 where nothing was traced.
 struct RParams { float4 cam; uint w, h, nInst, pad; };
+
+// Textures: RGBA8 in one buffer, bilinear, repeating (as the path tracer's sampleTex).
+inline float4 texel(device const uint *tx, TexInfo t, int x, int y) {
+    const uint c = tx[t.off + uint(y) * t.w + uint(x)];
+    return float4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24)) / 255.0f;
+}
+float4 sampleTex(device const uint *tx, device const TexInfo *ti, int id, float2 uv) {
+    const TexInfo t = ti[id];
+    const float fx = uv.x * float(t.w) - 0.5f, fy = uv.y * float(t.h) - 0.5f;
+    const float flx = floor(fx), fly = floor(fy);
+    const float ax = fx - flx, ay = fy - fly;
+    const int W = int(t.w), H = int(t.h);
+    int x0 = int(flx - floor(flx / float(W)) * float(W)), y0 = int(fly - floor(fly / float(H)) * float(H));
+    x0 = clamp(x0, 0, W - 1); y0 = clamp(y0, 0, H - 1);
+    const int x1 = x0 + 1 == W ? 0 : x0 + 1, y1 = y0 + 1 == H ? 0 : y0 + 1;
+    return mix(mix(texel(tx, t, x0, y0), texel(tx, t, x1, y0), ax), mix(texel(tx, t, x0, y1), texel(tx, t, x1, y1), ax), ay);
+}
+inline float3 unpack8(uint c) { return float3(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u)) / 255.0f; }
+
+// Reflection rays, only where the material asked for one (mask written by the PBR car shader):
+// m0 = (reflection direction, GGX alpha), m1 = (position - camera, weight; 0 = no ray).
+// out = (hit position, 1) for a hit, (0, 0, 0, 2) for a miss (sky), 0 where nothing was traced;
+// col = the hit shaded as the game shades it: the track with its texture, sun and baked light
+// (COLOR1^2 * AmbLevel), car materials with their colour, sun and hemisphere ambient (x2);
+// the sun's shadow by a shadow ray.
 kernel void rt_reflect(device const float4 *nodes [[buffer(0)]], device const float4 *tris [[buffer(1)]],
                        device const TNode *tlas [[buffer(2)]], device const uint *prims [[buffer(3)]],
                        device const Inst *insts [[buffer(4)]], constant RParams &P [[buffer(5)]],
                        device const float4 *mnodes [[buffer(6)]], device const float4 *mtris [[buffer(7)]],
                        device atomic_uint *count [[buffer(8)]],
+                       device const TriAttr *attrs [[buffer(9)]], device const TriAttr *mattrs [[buffer(10)]],
+                       device const uint *texels [[buffer(11)]], device const TexInfo *texinfo [[buffer(12)]],
+                       constant Light &L [[buffer(13)]], constant uint &nTex [[buffer(14)]],
                        texture2d<float, access::read> m0 [[texture(0)]], texture2d<float, access::read> m1 [[texture(1)]],
-                       texture2d<float, access::write> out [[texture(2)]], uint2 gid [[thread_position_in_grid]]) {
+                       texture2d<float, access::write> out [[texture(2)]], texture2d<half, access::write> col [[texture(3)]],
+                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= P.w || gid.y >= P.h) return;
     const float4 b = m1.read(gid);
     if (!(b.w > 0.0f)) { out.write(float4(0.0f), gid); return; }
@@ -179,11 +216,47 @@ kernel void rt_reflect(device const float4 *nodes [[buffer(0)]], device const fl
     const float3 O = P.cam.xyz + b.xyz;
     const float tMin = 0.002f * length(b.xyz) + 0.01f;
     float tMax = 1e5f;
-    Hit hit; hit.t = tMax; hit.n = float3(0, 1, 0); hit.inst = 0xFFFFFFFFu;
-    if (P.nInst > 0u && traceTlas(nodes, tris, mnodes, mtris, tlas, prims, insts, O, R, tMin, tMax, hit))
-        out.write(float4(O + R * hit.t, 1.0f), gid);
-    else
+    Hit hit; hit.t = tMax; hit.n = float3(0, 1, 0); hit.inst = 0xFFFFFFFFu; hit.prim = 0u; hit.u = hit.v = 0.0f;
+    if (P.nInst == 0u || !traceTlas(nodes, tris, mnodes, mtris, tlas, prims, insts, O, R, tMin, tMax, hit)) {
         out.write(float4(0.0f, 0.0f, 0.0f, 2.0f), gid);
+        return;
+    }
+    const float3 X = O + R * hit.t;
+    out.write(float4(X, 1.0f), gid);
+    // material at the hit
+    const Inst in = insts[hit.inst];
+    const bool merged = (in.flags & 1u) != 0u;
+    const TriAttr a = merged ? mattrs[hit.prim] : attrs[in.attrBase + hit.prim];
+    const float w0 = 1.0f - hit.u - hit.v;
+    float2 uv = a.uv0 * w0 + a.uv1 * hit.u + a.uv2 * hit.v;
+    if (!merged && (in.flags & 4u) != 0u) uv = float2(dot(in.uvm0.xyz, float3(uv, 1.0f)), dot(in.uvm1.xyz, float3(uv, 1.0f)));
+    const uint tid = (a.tex & 0x7FFFFFFFu) != 0x7FFFFFFFu ? (a.tex & 0x7FFFFFFFu) : uint(in.tex);
+    float3 albedo = in.color.rgb;
+    if (int(tid) >= 0 && tid < nTex) albedo *= sampleTex(texels, texinfo, int(tid), uv).rgb;
+    float3 n = normalize(hit.n.x * in.r0.xyz + hit.n.y * in.r1.xyz + hit.n.z * in.r2.xyz);
+    if (dot(n, R) > 0.0f) n = -n;
+    const float3 S = normalize(L.sunDir.xyz);
+    const float NL = saturate(dot(n, S));
+    float sh = 0.0f;
+    if (NL > 0.0f) {
+        float tS = 1e5f;
+        Hit h2; h2.t = tS; h2.inst = 0xFFFFFFFFu;
+        sh = traceTlas(nodes, tris, mnodes, mtris, tlas, prims, insts, X + n * (0.002f * hit.t + 0.02f), S, 0.0f, tS, h2, true) ? 0.0f : 1.0f;
+    }
+    const float3 sun = L.sunCol.rgb * NL * sh;
+    float3 c;
+    if ((in.flags & 2u) != 0u) {
+        const float up = saturate(n.y);
+        c = 2.0f * albedo * (sun + mix(L.ambLo.rgb, L.ambHi.rgb, up * up));
+    } else {
+        float3 baked;
+        if ((a.tex & 0x80000000u) != 0u) {
+            const float3 k = unpack8(a.c0) * w0 + unpack8(a.c1) * hit.u + unpack8(a.c2) * hit.v;
+            baked = k * k * L.ambLevel;
+        } else baked = float3(0.26f, 0.34f, 0.41f) * L.ambLevel;   // the track's average sky light
+        c = albedo * (sun + baked);
+    }
+    col.write(half4(half3(c), 1.0h), gid);
 }
 
 // Debug view: one primary ray per pixel, shaded by the angle to the surface, one tint per instance.
@@ -236,10 +309,12 @@ struct State {
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> view;
     id<MTLBuffer> nodes, tris;                 // BLAS data, grown as needed
-    id<MTLBuffer> mnodes, mtris;               // the merged world-space BLAS
+    id<MTLBuffer> mnodes, mtris, mattr;        // the merged world-space BLAS
+    id<MTLBuffer> attr, texels, texinfo;       // triangle attributes, textures
+    uint32_t ntex = 0;
     id<MTLBuffer> frame[3];                    // instances, TLAS nodes, TLAS leaf indices
     Img vimg;                                  // debug view (RGBA16F)
-    Img m0, m1, hit;                           // reflection mask (from GL), hit points (to GL)
+    Img m0, m1, hit, hcol;                     // reflection mask (from GL), hit points and their colour (to GL)
     id<MTLComputePipelineState> reflect;
     id<MTLBuffer> counter;
 };
@@ -330,9 +405,28 @@ void rtm_blas(const void *nodes, size_t n_nodes, size_t from_nodes, const void *
     upload(S.tris, tris, grew ? 0 : from_tris * 16, n_tris * 16);
 }
 
-void rtm_merged(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris) {
+void rtm_attrs(const void *attr, size_t n, size_t from) {
     if (!init()) return;
     bool grew;
+    S.attr = ensure(S.attr, n * 40 + 64, &grew);
+    upload(S.attr, attr, grew ? 0 : from * 40, n * 40);
+}
+void rtm_textures(const uint32_t *texels, size_t n_texels, size_t from_texels, const void *info, size_t n_info) {
+    if (!init()) return;
+    bool grew;
+    S.texels = ensure(S.texels, n_texels * 4 + 64, &grew);
+    upload(S.texels, texels, grew ? 0 : from_texels * 4, n_texels * 4);
+    S.texinfo = ensure(S.texinfo, n_info * 16 + 64, &grew);
+    upload(S.texinfo, info, 0, n_info * 16);
+    S.ntex = (uint32_t)n_info;
+}
+unsigned rtm_hit_colour() { return S.hcol.gl; }
+
+void rtm_merged(const void *nodes, size_t n_nodes, const void *tris, size_t n_tris, const void *attr, size_t n_attr) {
+    if (!init()) return;
+    bool grew;
+    S.mattr = ensure(S.mattr, n_attr * 40 + 64, &grew);
+    upload(S.mattr, attr, 0, n_attr * 40);
     S.mnodes = ensure(S.mnodes, n_nodes * 16 + 16, &grew);
     upload(S.mnodes, nodes, 0, n_nodes * 16);
     S.mtris = ensure(S.mtris, n_tris * 16 + 16, &grew);
@@ -387,10 +481,11 @@ bool rtm_mask_textures(int w, int h, unsigned *gl_m0, unsigned *gl_m1) {
 }
 
 unsigned rtm_trace_reflect(const RtmInst *inst, size_t n_inst, const void *tlas_nodes, size_t n_tlas, const uint32_t *prim, size_t n_prim,
-                           const float *cam, uint32_t *rays, double *gpu_ms) {
+                           const float *cam, const RtmLight &light, uint32_t *rays, double *gpu_ms) {
     if (!init() || !S.nodes || !S.tris || !S.m0.tex || !S.m1.tex) return 0;
     int w = S.m1.w, h = S.m1.h;
-    if (!ensure_img(S.hit, w, h, false, "reflection hits")) return 0;
+    if (!ensure_img(S.hit, w, h, false, "reflection hits") || !ensure_img(S.hcol, w, h, true, "reflection hit colours")) return 0;
+    if (!S.attr || !S.texels || !S.texinfo) return 0;
     glFlush();   // the masks were just rendered by OpenGL
     @autoreleasepool {
         const void *src[3] = {inst, tlas_nodes, prim};
@@ -416,9 +511,16 @@ unsigned rtm_trace_reflect(const RtmInst *inst, size_t n_inst, const void *tlas_
         [enc setBuffer:(S.mnodes ? S.mnodes : S.nodes) offset:0 atIndex:6];
         [enc setBuffer:(S.mtris ? S.mtris : S.tris) offset:0 atIndex:7];
         [enc setBuffer:S.counter offset:0 atIndex:8];
+        [enc setBuffer:S.attr offset:0 atIndex:9];
+        [enc setBuffer:(S.mattr ? S.mattr : S.attr) offset:0 atIndex:10];
+        [enc setBuffer:S.texels offset:0 atIndex:11];
+        [enc setBuffer:S.texinfo offset:0 atIndex:12];
+        [enc setBytes:&light length:sizeof light atIndex:13];
+        [enc setBytes:&S.ntex length:4 atIndex:14];
         [enc setTexture:S.m0.tex atIndex:0];
         [enc setTexture:S.m1.tex atIndex:1];
         [enc setTexture:S.hit.tex atIndex:2];
+        [enc setTexture:S.hcol.tex atIndex:3];
         [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         [enc endEncoding];
         [cb commit];

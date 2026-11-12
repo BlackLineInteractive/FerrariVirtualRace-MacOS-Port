@@ -82,6 +82,7 @@ struct Texture : Obj {
     bool autogen = false;
     bool rendered = false;      // rendered to since mips were last generated
     bool shadow = false;        // depth format sampled as a depth comparison (D16 / D24X8 / D24S8 ...)
+    int rt_tex = -1;            // id in the ray tracer's texture store (rt_texture), -1 none
     bool sysmem() const { return pool == 2 || pool == 3; }
     ~Texture();
 };

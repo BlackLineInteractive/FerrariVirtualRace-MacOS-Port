@@ -38,7 +38,8 @@ Status:
 - **Materials.** `pbr=1` converts the car material to GGX / Schlick with clear coat and Fresnel glass (runtime/pbr.cpp).
 - **Rays only where they pay off.** Whitted rays suit mirror-like surfaces only: the PBR shader marks pixels with roughness below about 0.2 and a reflection (clear coat, glass, chrome, later the wet track), and Metal traces just those, a fraction of the frame; rough surfaces keep the cube map, SSR or ambient light.
 - **Reflections (`rt=1`).** Done for the car: mask from the PBR shader, Metal traces only those pixels (20,000-40,000 rays, 0.5-2 ms), hits coloured from the frame when visible, else from the game's cube.
-- **Next:** shade off-screen hits in Metal: the diffuse texture at the hit (textures and UVs uploaded with each BLAS), the sun with a shadow ray, the hemisphere sky and the track's baked light; then the track itself (wet asphalt) and glass refraction.
+- **Hit shading.** Done: texture at the hit (215 textures, 8 MB as copies of at most 128x128), sun with a shadow ray, the track's baked light, the cars' hemisphere light; 1.5-2.6 ms in Metal for about 26,000 rays.
+- **Next:** the track itself (wet asphalt, after a material table for its textures), glass refraction, fog at distant hits, and moving the mask's off-car surfaces (track windows) to the same path.
 
 1. **Scene capture.** The port already sees every draw: vertex and index buffers, the vertex declaration and, per draw, the world matrix (`WorldMtx` c0) and the previous frame's match used for motion vectors. Each distinct mesh becomes a bottom-level acceleration structure (built once, refitted for the cars' moving parts) and each frame's draws an instance list for the top level.
 2. **Materials.** Rays need albedo, normals and textures at the hit point: the diffuse texture bound to sampler 0 and the material constants of each draw, recorded together with the instance.
