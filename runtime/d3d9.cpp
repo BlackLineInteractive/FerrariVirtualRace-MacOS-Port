@@ -1806,9 +1806,42 @@ static void baked_flat(Program *p) {
     if (memcmp(v, p->u_baked, 16)) { glUniform4fv(p->bakedFlat, 1, v); memcpy(p->u_baked, v, 16); }
 }
 
+// FVR_MAT_LOG=<seconds>: logs one scene frame's draws grouped by shaders, blend state, textures
+// and the car material constants (how the game draws paint, glass and lights).
+static void mat_log_draw() {
+    static double at = getenv("FVR_MAT_LOG") ? atof(getenv("FVR_MAT_LOG")) : -1;
+    static uint64_t frame = ~0ull; static int state;
+    static std::map<std::string, int> groups;
+    if (at < 0 || state == 2) return;
+    if (state == 0) { if (SDL_GetTicks() / 1000.0 < at) return; state = 3; frame = D->frame + 1; }
+    if (state == 3) { if (D->frame != frame) return; state = 1; }
+    if (D->frame != frame) {
+        for (auto &g : groups) rtlog("mat: %4d x %s", g.second, g.first.c_str());
+        state = 2; return;
+    }
+    if (!D->taa_bound) return;
+    const uint32_t *rs = D->st.rs;
+    char b[1024];
+    std::string vsn = D->st.vs ? rt_shader_name(D->st.vs) : "ff", psn = D->st.ps ? rt_shader_name(D->st.ps) : "ff";
+    auto has = [&](const char *n) { return D->st.ps && D->st.ps->ctab.count(n); };
+    std::string mat;
+    if (has("FresnelLevel")) {
+        const float (*c)[4] = D->st.psf;
+        snprintf(b, sizeof b, " | Diff %.2f %.2f %.2f a%.2f Spec %.2f Refl %.2f %.2f %.2f Metal %.2f Fres %.2f %.2f %.2f Fall %.2f %.2f %.2f SpecSize %.0f %.2f %.0f",
+                 c[0][0], c[0][1], c[0][2], c[0][3], c[2][0], c[4][0], c[4][1], c[4][2], c[3][0], c[9][0], c[9][1], c[9][2], c[8][0], c[8][1], c[8][2], c[7][0], c[7][1], c[7][2]);
+        mat = b;
+    }
+    Texture *t0 = (Texture *)D->st.tex[0];
+    Texture *t9 = (Texture *)D->st.tex[9];
+    snprintf(b, sizeof b, "blend %d (%u,%u) atest %d zwrite %d cull %u tex0 %ux%u env %ux%u%s | VS[%s] PS[%s]%s", (int)rs[27], rs[19], rs[20], (int)rs[15], (int)rs[14], rs[22],
+             t0 ? t0->w : 0, t0 ? t0->h : 0, t9 ? t9->w : 0, t9 ? t9->h : 0, t9 && (t9->usage & 1) ? " (rendered)" : "", vsn.c_str(), psn.c_str(), mat.c_str());
+    groups[b]++;
+}
+
 // dkey: identifies the draw's geometry range (motion-vector matching across frames)
 static Program *prepare_draw(uint64_t dkey = 0) {
     D->draws++;
+    mat_log_draw();
     bind_rt_fbo();
     if (D->vp_dirty) apply_viewport();
     if (D->rs_dirty) apply_render_state();
