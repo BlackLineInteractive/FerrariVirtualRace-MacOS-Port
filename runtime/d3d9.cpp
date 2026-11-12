@@ -910,13 +910,15 @@ struct Gfx { bool rt, pbr, refl; float ao, ssr; bool init; };
 static Gfx g_gfx;
 static void gfx_update();
 // The scene goes to the port's own targets (taa_bind) for the temporal modes, and at full size
-// for ray tracing, AO or SSR with the other non-multisampled modes (off, FXAA): 0 = not at all.
+// whenever ray tracing, AO or SSR is on with any other mode: those need the scene single-sampled,
+// so they take precedence over MSAA (MSAA 2x-8x then act as off, FSR 1 keeps its upscale and
+// sharpening). 0 = not at all.
 int post_msaa_samples();
 static float scene_scale() {
     float t = post_temporal_scale();
     if (t > 0) return t;
     if (!g_gfx.init) gfx_update();
-    if ((g_gfx.rt || g_gfx.ao > 0 || g_gfx.ssr > 0) && post_msaa_samples() == 0) return 1.0f;
+    if (g_gfx.rt || g_gfx.ao > 0 || g_gfx.ssr > 0) return 1.0f;
     return 0;
 }
 static bool taa_eligible() {
@@ -1084,8 +1086,8 @@ static const char *kOptionsTemplate =
     "# Video settings, below Shadow detail level. Choosing them there writes the lines below.\n"
     "#\n"
     "# Remove the # in front of a line to set it here. Each setting can also be given for one run\n"
-    "# as FVR_<NAME> (for example FVR_AO=0.5). ao, ssr and rt need Antialias set to off, FXAA or a\n"
-    "# Temporal entry (not MSAA / FSR 1).\n"
+    "# as FVR_<NAME> (for example FVR_AO=0.5). While ao, ssr or rt is on, MSAA is not used (the\n"
+    "# effects need the scene single-sampled); the Temporal entries of Antialias suit them best.\n"
     "\n"
     "# Ambient occlusion (GTAO): strength 0 (off) .. 1. Menu: off 0, low 0.4, medium 0.7, high 1.\n"
     "#ao = 0.7\n"
